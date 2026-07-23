@@ -82,7 +82,7 @@ pub fn warn_insecure() {
 }
 
 /// Builds the ordered MASQUE endpoint list without taking over DNS, routing,
-/// or firewall policy from the host BSD system.
+/// or firewall policy from the host FreeBSD system.
 ///
 /// `prefer_ipv6` changes ordering only: the other family remains available as
 /// a connection fallback. `port_override == 0` uses the API-provided port list
