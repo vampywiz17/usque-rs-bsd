@@ -124,7 +124,7 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   ordered endpoint list. Existing configurations remain valid and use port 443
   when they do not contain an API port list.
 - Endpoint fallback is transport-only. DNS policy, routing and firewall state
-  remain owned by the host BSD system.
+  remain owned by the host FreeBSD system.
 - The FreeBSD raw TUN direction is documented but is not enabled by default; `tun-rs` remains the production backend.
 - See [FreeBSD raw TUN notes](docs/FREEBSD_RAW_TUN_NOTES.md) for the current design considerations.
 
