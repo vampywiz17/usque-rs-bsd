@@ -72,7 +72,9 @@ pub struct NativeTunArgs {
     pub no_tunnel_ipv6: bool,
     #[arg(short = 's', long, default_value = internal::CONNECT_SNI)]
     pub sni_address: String,
-    #[arg(short = 'k', long, default_value = "30s", value_parser = parse_duration)]
+    /// Send an RFC 9000 QUIC PING after this much network inactivity.
+    /// Use 0s to disable keepalive.
+    #[arg(short = 'k', long, default_value = "25s", value_parser = parse_duration)]
     pub keepalive_period: Duration,
     #[arg(short = 'm', long, default_value_t = 1200)]
     pub mtu: u16,
@@ -221,6 +223,14 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
     }
     if args.mtu != 1200 {
         tracing::warn!("MTU is not the tuned FreeBSD default 1200 for this release. Packet loss and jitter may increase.");
+    }
+    if args.keepalive_period.is_zero() {
+        tracing::info!("QUIC keepalive is disabled");
+    } else {
+        tracing::info!(
+            "QUIC keepalive will send an RFC 9000 PING after {:?} of network inactivity",
+            args.keepalive_period
+        );
     }
 
     let endpoint = config::select_endpoint_from_config(&cfg, args.ipv6, args.connect_port)?;

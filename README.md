@@ -74,6 +74,7 @@ The application configures interface addresses and MTU, but does not manage the 
 | `--initial-packet-size` | `1250` | Leaves room for QUIC/MASQUE overhead |
 | `--tx-queue-len` | `8192` | Decouples the TUN reader from QUIC pacing |
 | `--tx-burst-packets` | `256` | Stable upload-performance compromise |
+| `--keepalive-period` | `25s` | Sends an RFC 9000 QUIC PING after network inactivity; use `0s` to disable |
 
 Optional tuning example:
 
@@ -99,6 +100,9 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
 ## Implementation notes
 
 - `quiche` is pinned to `0.29.2` with the `gcongestion` feature.
+- Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
+  the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
+  native TUN interface.
 - The MASQUE DATAGRAM queue uses `Connection::dgram_send_buf()` to avoid an additional slice copy.
 - The FreeBSD raw TUN direction is documented but is not enabled by default; `tun-rs` remains the production backend.
 - See [FreeBSD raw TUN notes](docs/FREEBSD_RAW_TUN_NOTES.md) for the current design considerations.

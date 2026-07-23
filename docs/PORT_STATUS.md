@@ -14,6 +14,8 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 - H3 DATAGRAM encoding implemented as `varint(flow_id) + varint(context_id=0) + IP packet`.
 - IPv4 TTL / IPv6 hop-limit decrement and basic checksum handling implemented.
 - Basic ICMP Packet Too Big generation included for datagram send errors.
+- Configurable, inactivity-aware RFC 9000 QUIC PING keepalive included
+  (`25s` by default, `0s` disables it).
 - Reconnect loop and connect/disconnect hooks included.
 
 ## Removed

@@ -309,442 +309,106 @@ async fn run_tunnel_session(
         tracing::warn!("--insecure is set; skipping endpoint public key pinning");
     }
 
-    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyâ€¦2262 tokens truncatedâ€¦.push_back(tx_dgram);
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        tun_reader_closed = true;
-                        break;
-                    }
-                }
-            }
+    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow!("h3 config: {e}"))?;
+    h3_config.enable_extended_connect(true);
+    let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
+        .map_err(|e| anyhow!("h3 connection: {e}"))?;
 
-            let progress = queue_tx_datagrams(conn, &mut tx_queue, stats, tx_burst_packets);
-            if progress.queued > 0 {
-                flush_quic(socket, conn, out).await?;
-            } else if progress.backpressure {
-                // Quiche's DATAGRAM queue is full. Push already-queued QUIC packets
-                // out to UDP and then wait for ACKs/timers instead of burning CPU.
-                flush_quic(socket, conn, out).await?;
-            }
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        quiche::h3::Header::new(b"user-agent", b""),
+    ];
+    let stream_id = h3_conn
+        .send_request(&mut conn, &req, false)
+        .map_err(|e| anyhow!("send CONNECT request: {e}"))?;
+    let flow_id = stream_id / 4;
+    tracing::debug!("CONNECT request sent on stream {stream_id}, H3 DATAGRAM flow_id={flow_id}");
 
-            stats.tx_queue_len.store(tx_queue.len() as u64, Ordering::Relaxed);
-            let qs = conn.stats();
-            stats.quic_lost.store(qs.lost as u64, Ordering::Relaxed);
-            stats.quic_retrans.store(qs.retrans as u64, Ordering::Relaxed);
+    flush_quic(&socket, &mut conn, &mut out).await?;
+    wait_connect_response(&socket, endpoint, local_addr, &mut conn, &mut h3_conn, stream_id, &mut buf, &mut out).await?;
 
-            if conn.is_closed() {
-                bail!("QUIC connection closed");
-            }
-            if tun_reader_closed && tx_queue.is_empty() {
-                bail!("TUN reader ended");
-            }
-
-            // If we still have queued DATAGRAMs and quiche accepted a full burst,
-            // continue immediately. This batches upload traffic without the naive
-            // per-packet sleep that hurt throughput in the pacing build.
-            if !tx_queue.is_empty() && progress.queued >= tx_burst_packets && !progress.backpressure {
-                continue;
-            }
-
-            let timeout = conn.timeout().unwrap_or(keepalive_period).min(keepalive_period);
-            tokio::select! {
-                biased;
-                result = socket.recv(buf) => {
-                    let len = result?;
-                    let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                    if let Err(e) = conn.recv(&mut buf[..len], recv_info) {
-                        tracing::debug!("QUIC recv error: {e}");
-                    }
-                }
-                maybe_tx_dgram = tx_rx.recv(), if !tun_reader_closed && tx_queue.len() < tx_queue_len => {
-                    match maybe_tx_dgram {
-                        Some(tx_dgram) => {
-                            tx_queue.push_back(tx_dgram);
-                        }
-                        None => tun_reader_closed = true,
-                    }
-                }
-                () = tokio::time::sleep(timeout) => conn.on_timeout(),
-            }
-        }
+    tracing::info!("Connected to MASQUE server");
+    if let Some(path) = &cfg.on_connect {
+        let mut env = cfg.hook_env.clone();
+        env.insert("USQUE_EVENT".to_string(), "connect".to_string());
+        env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
+        run_hook(path, &env);
     }
+
+    let stats = Stats::new();
+    let stats_handle = spawn_stats_task(stats.clone(), Instant::now());
+    let flow_prefix = build_flow_prefix(flow_id)?;
+
+    if let Some(mut pkt) = pending_pkt.take() {
+        send_packet_datagram(&socket, endpoint, local_addr, &mut conn, &flow_prefix, &mut pkt, &stats, dev, &mut buf, &mut out).await?;
+        flush_quic(&socket, &mut conn, &mut out).await?;
+    }
+
+    let result = data_loop(
+        &socket,
+        endpoint,
+        local_addr,
+        &mut conn,
+        &mut h3_conn,
+        dev,
+        mtu,
+        &flow_prefix,
+        flow_id,
+        &stats,
+        cfg.keepalive_period,
+        cfg.tx_queue_len.max(1),
+        cfg.tx_burst_packets.max(1),
+        &mut buf,
+        &mut out,
+    )
     .await;
 
-    tun_reader.abort();
+    stats_handle.abort();
+    if let Some(path) = &cfg.on_disconnect {
+        let mut env = cfg.hook_env.clone();
+        env.insert("USQUE_EVENT".to_string(), "disconnect".to_string());
+        env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
+        run_hook(path, &env);
+    }
+
     result
 }
 
-async fn build_tx_datagram(
-    conn: &quiche::Connection,
-    flow_prefix: &[u8],
-    mut pkt: Vec<u8>,
-    stats: &Arc<Stats>,
-    dev: &Arc<TunRsDevice>,
-) -> Option<TxDatagram> {
-    if let Err(e) = packet::prepare_outgoing(&mut pkt) {
-        stats.dropped.fetch_add(1, Ordering::Relaxed);
-        tracing::trace!("dropping outgoing packet: {e}");
-        return None;
-    }
-
-    let ip_len = pkt.len();
-    let mut dgram = Vec::with_capacity(flow_prefix.len() + ip_len);
-    dgram.extend_from_slice(flow_prefix);
-    dgram.extend_from_slice(&pkt);
-
-    if let Some(max_len) = conn.dgram_max_writable_len() {
-        if dgram.len() > max_len {
-            stats.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                "datagram too large for peer/path: {} > {}; generating ICMP Packet Too Big if possible",
-                dgram.len(),
-                max_len
-            );
-            if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&pkt, MIN_MTU) {
-                let _ = dev.send_packet(&icmp_pkt).await;
-            }
-            return None;
-        }
-    }
-
-    Some(TxDatagram { bytes: dgram, ip_len })
-}
-
-fn queue_tx_datagrams(
-    conn: &mut quiche::Connection,
-    tx_queue: &mut VecDeque<TxDatagram>,
-    stats: &Arc<Stats>,
-    tx_burst_packets: usize,
-) -> TxProgress {
-    let mut progress = TxProgress { queued: 0, backpressure: false };
-    let budget = tx_burst_packets.max(1);
-
-    while progress.queued < budget {
-        let Some(item) = tx_queue.pop_front() else {
-            break;
-        };
-
-        if let Some(max_len) = conn.dgram_max_writable_len() {
-            if item.bytes.len() > max_len {
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    "dropping encoded DATAGRAM that exceeds peer/path writable len: {} > {}",
-                    item.bytes.len(),
-                    max_len
-                );
-                continue;
-            }
-        }
-
-        // quiche::Connection::dgram_send() copies the DATAGRAM payload into
-        // quiche's internal queue. We already own an encoded MASQUE/H3 DATAGRAM
-        // Vec at this point, so use dgram_send_buf() to hand ownership to
-        // quiche and avoid one memcpy on the upload hot path. This mirrors the
-        // zero-copy DATAGRAM API described by quiche.
-        if conn.is_dgram_send_queue_full() {
-            stats.tx_backpressure.fetch_add(1, Ordering::Relaxed);
-            tx_queue.push_front(item);
-            progress.backpressure = true;
-            break;
-        }
-
-        let ip_len = item.ip_len;
-        match conn.dgram_send_buf(item.bytes) {
-            Ok(()) => {
-                stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                stats.tx_bytes.fetch_add(ip_len as u64, Ordering::Relaxed);
-                progress.queued += 1;
-            }
-            Err(quiche::Error::Done) => {
-                // This should be rare because we checked is_dgram_send_queue_full()
-                // just above. dgram_send_buf() consumes the buffer, so we cannot
-                // safely retry the exact same owned Vec here. Count it separately
-                // as both backpressure and a drop so it is visible in logs.
-                stats.tx_backpressure.fetch_add(1, Ordering::Relaxed);
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                progress.backpressure = true;
-                break;
-            }
-            Err(e) => {
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("datagram send_buf error: {e}; dropping encoded DATAGRAM");
-            }
-        }
-    }
-
-    progress
-}
-
-fn poll_h3(conn: &mut quiche::Connection, h3_conn: &mut quiche::h3::Connection) {
-    loop {
-        match h3_conn.poll(conn) {
-            Ok(_) => {}
-            Err(quiche::h3::Error::Done) => break,
-            Err(e) => {
-                tracing::warn!("h3 poll error: {e}");
-                break;
-            }
-        }
-    }
-}
-
-async fn drain_incoming_datagrams(
-    conn: &mut quiche::Connection,
-    flow_id: u64,
-    stats: &Arc<Stats>,
-    dev: &Arc<TunRsDevice>,
-) {
-    loop {
-        match conn.dgram_recv_buf() {
-            Ok(dgram) => {
-                let dgram_ref = dgram.as_ref();
-                if let Some(ip_payload) = parse_datagram(dgram_ref, flow_id) {
-                    if packet::validate_incoming(ip_payload).is_ok() {
-                        stats.rx_packets.fetch_add(1, Ordering::Relaxed);
-                        stats.rx_bytes.fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
-                        if let Err(err) = dev.send_packet(ip_payload).await {
-                            tracing::warn!("failed to write received packet to TUN: {err:#}");
-                        }
-                    }
-                }
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => {
-                tracing::debug!("datagram recv error: {e}");
-                break;
-            }
-        }
-    }
-}
-
-async fn send_packet_datagram(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    flow_prefix: &[u8],
-    pkt: &mut [u8],
-    stats: &Arc<Stats>,
-    dev: &Arc<TunRsDevice>,
-    buf: &mut [u8],
-    out: &mut [u8],
-) -> Result<()> {
-    match packet::prepare_outgoing(pkt) {
-        Ok(_) => {
-            let pkt_len = pkt.len() as u64;
-            let mut dgram = Vec::with_capacity(flow_prefix.len() + pkt.len());
-            dgram.extend_from_slice(flow_prefix);
-            dgram.extend_from_slice(pkt);
-
-            if let Some(max_len) = conn.dgram_max_writable_len() {
-                if dgram.len() > max_len {
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
-                        "datagram too large for peer/path: {} > {}; generating ICMP Packet Too Big if possible",
-                        dgram.len(),
-                        max_len
-                    );
-                    if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, MIN_MTU) {
-                        let _ = dev.send_packet(&icmp_pkt).await;
-                    }
-                    return Ok(());
-                }
-            }
-
-            // Min-copy pending-packet path: the steady-state TUN reader already
-            // hands the encoded DATAGRAM Vec to quiche with dgram_send().
-            // This path is used only for the single packet captured while waiting
-            // for reconnect, but keep it copy-minimal as well. dgram_send_buf()
-            // takes ownership and avoids quiche's internal DATAGRAM payload copy.
-            for attempt in 0..512u16 {
-                if !conn.is_dgram_send_queue_full() {
-                    match conn.dgram_send_buf(dgram) {
-                        Ok(()) => {
-                            stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                            stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            stats.dropped.fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!("datagram send_buf error: {e}; generating ICMP Packet Too Big if possible");
-                            if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, MIN_MTU) {
-                                let _ = dev.send_packet(&icmp_pkt).await;
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-
-                flush_quic(socket, conn, out).await?;
-                drain_udp_nonblocking(socket, endpoint, local_addr, conn, buf);
-
-                if conn.is_closed() {
-                    bail!("QUIC connection closed while waiting for DATAGRAM queue space");
-                }
-
-                let wait = conn
-                    .timeout()
-                    .unwrap_or(Duration::from_millis(1))
-                    .min(Duration::from_millis(2));
-                tokio::select! {
-                    result = socket.recv(buf) => {
-                        let len = result?;
-                        let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                        if let Err(e) = conn.recv(&mut buf[..len], recv_info) {
-                            tracing::debug!("QUIC recv while applying DATAGRAM backpressure failed: {e}");
-                        }
-                    }
-                    () = tokio::time::sleep(wait) => conn.on_timeout(),
-                }
-
-                if attempt > 0 && attempt % 64 == 0 {
-                    tracing::trace!(
-                        "waiting for DATAGRAM queue space: attempt={} queue_len={} queue_bytes={}",
-                        attempt,
-                        conn.dgram_send_queue_len(),
-                        conn.dgram_send_queue_byte_size()
-                    );
-                }
-            }
-
-            stats.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::trace!("datagram send queue stayed full after backpressure retries, dropping packet");
-            Ok(())
-        }
-        Err(e) => {
-            stats.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::trace!("dropping outgoing packet: {e}");
-            Ok(())
-        }
-    }
-}
-
-fn drain_udp_nonblocking(
+async fn complete_quic_handshake(
     socket: &tokio::net::UdpSocket,
     endpoint: SocketAddr,
     local_addr: SocketAddr,
     conn: &mut quiche::Connection,
     buf: &mut [u8],
-) {
-    while let Ok(len) = socket.try_recv(buf) {
-        let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-        if let Err(e) = conn.recv(&mut buf[..len], recv_info) {
-            tracing::debug!("QUIC recv error while draining UDP: {e}");
-        }
-    }
-}
-
-async fn flush_quic(
-    socket: &tokio::net::UdpSocket,
-    conn: &mut quiche::Connection,
     out: &mut [u8],
 ) -> Result<()> {
-    loop {
-        match conn.send(out) {
-            Ok((write, send_info)) => {
-                let _ = send_info;
-                socket.send(&out[..write]).await?;
+    while !conn.is_established() {
+        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
+        tokio::select! {
+            result = socket.recv(buf) => {
+                let len = result?;
+                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
+                conn.recv(&mut buf[..len], recv_info).ok();
             }
-            Err(quiche::Error::Done) => break,
-            Err(e) => bail!("quic send error: {e}"),
+            () = tokio::time::sleep(timeout) => conn.on_timeout(),
+        }
+        flush_quic(socket, conn, out).await?;
+        if conn.is_closed() {
+            bail!("connection closed during QUIC handshake");
         }
     }
     Ok(())
 }
 
-fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
-    let mut tmp = [0u8; 8];
-    let mut b = OctetsMut::with_slice(&mut tmp);
-    b.put_varint(flow_id).map_err(|e| anyhow!("encode flow_id varint: {e}"))?;
-    let len = b.off();
-    let mut flow_prefix = Vec::with_capacity(len + 1);
-    flow_prefix.extend_from_slice(&tmp[..len]);
-    flow_prefix.push(0x00);
-    Ok(flow_prefix)
-}
-
-fn parse_datagram(dgram: &[u8], expected_flow_id: u64) -> Option<&[u8]> {
-    let mut b = Octets::with_slice(dgram);
-    let flow_id = b.get_varint().ok()?;
-    if flow_id != expected_flow_id {
-        return None;
-    }
-    let context_id = b.get_varint().ok()?;
-    if context_id != 0 {
-        return None;
-    }
-    let off = b.off();
-    if off >= dgram.len() {
-        return None;
-    }
-    Some(&dgram[off..])
-}
-
-fn spawn_stats_task(stats: Arc<Stats>, start: Instant) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            tracing::info!(
-                "connected={} tx={} ({}) rx={} ({}) drop={} txq={} bp={} lost={} retrans={}",
-                format_duration(start.elapsed()),
-                stats.tx_packets.load(Ordering::Relaxed),
-                format_bytes(stats.tx_bytes.load(Ordering::Relaxed)),
-                stats.rx_packets.load(Ordering::Relaxed),
-                format_bytes(stats.rx_bytes.load(Ordering::Relaxed)),
-                stats.dropped.load(Ordering::Relaxed),
-                stats.tx_queue_len.load(Ordering::Relaxed),
-                stats.tx_backpressure.load(Ordering::Relaxed),
-                stats.quic_lost.load(Ordering::Relaxed),
-                stats.quic_retrans.load(Ordering::Relaxed),
-            );
-        }
-    })
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn encode_varint(val: u64) -> Vec<u8> {
-        let mut tmp = [0u8; 8];
-        let mut b = OctetsMut::with_slice(&mut tmp);
-        b.put_varint(val).unwrap();
-        tmp[..b.off()].to_vec()
-    }
-
-    #[test]
-    fn parse_datagram_valid() {
-        let mut d = encode_varint(4);
-        d.extend_from_slice(&encode_varint(0));
-        d.extend_from_slice(b"payload");
-        assert_eq!(parse_datagram(&d, 4), Some(b"payload".as_ref()));
-    }
-}
+async fn wait_connect_response(
+    socket: &tokio::net::UdpSocket,
+    endpoint: SocketAddr,
+    local_addr: SocketAddr,
+    conn: &mut quiche::Connection,
+    h3_conn: &mut quiche::h3::Connection,
+    stream_id: ßOt¶‰žËkºwµçQ¥¹œ½¹¹•Ñ¥½¸­••Á…±¥Ù”¸-••Á¥¹œ(€€€€€€€€€€€€€€€€€€€€€€€€¼¼Ñ¡¥Ì…ÐÑ¡”EU%±…å•È…Ù½¥‘ÌÍå¹Ñ¡•Ñ¥ŒÑÉ…™™¥Œ¥¹Í¥‘”(€€€€€€€€€€€€€€€€€€€€€€€€¼¼Ñ¡”QU8¥¹Ñ•É™…”…¹¥Ì¥¹‘•Á•¹‘•¹Ð½˜Ñ¡”ÑÕ¸µÉÌ(€€€€€€€€€€€€€€€€€€€€€€€€¼¼Á±…Ñ™½É´‰…­•¹¸(€€€€€€€€€€€€€€€€€€€€€€€½¹¸¹Í•¹‘}…­}•±¥¥Ñ¥¹œ ¤(€€€€€€€€€€€€€€€€€€€€€€€€€€€€¹µ…Á}•ÉÈ¡ñ•ð…¹å¡½Ü„ ‰™…¥±•Ñ¼Í¡•‘Õ±”EU%­••Á…±¥Ù”A%9èí•ôˆ¤¤üì(€€€€€€€€€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ ‰Í¡•‘Õ±•EU%­••Á…±¥Ù”A%9ˆ¤ì(€€€€€€€€€€€€€€€€€€€€€€€±…ÍÑ}¹•ÑÝ½É­}…Ñ¥Ù¥Ñä€ô%¹ÍÑ…¹Ðèé¹½Ü ¤ì(€€€€€€€€€€€€€€€€€€€€€€€™±ÕÍ €ôÑÉÕ”ì(€€€€€€€€€€€€€€€€€€€ô((€€€€€€€€€€€€€€€€€€€¥˜™±ÕÍ ì(€€€€€€€€€€€€€€€€€€€€€€€™±ÕÍ¡}ÅÕ¥Œ¡Í½­•Ð°½¹¸°½ÕÐ¤¹…Ý…¥Ðüì(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€ô(€€€€€€€ô(€€€ô(€€€€¹…Ý…¥Ðì((€€€ÑÕ¹}É•…‘•È¹…‰½ÉÐ ¤ì(€€€É•ÍÕ±Ð)ô()…Íå¹Œ™¸‰Õ¥±‘}Ñá}‘…Ñ…É…´ (€€€½¹¸è€™ÅÕ¥¡”èé½¹¹•Ñ¥½¸°(€€€™±½Ý}ÁÉ•™¥àè€™mÔát°(€€€µÕÐÁ­ÐèY•ŒñÔàø°(€€€ÍÑ…ÑÌè€™ÉŒñMÑ…ÑÌø°(€€€‘•Øè€™ÉŒñQÕ¹IÍ•Ù¥”ø°(¤€´ø=ÁÑ¥½¸ñQá…Ñ…É…´øì(€€€¥˜±•ÐÉÈ¡”¤€ôÁ…­•ÐèéÁÉ•Á…É•}½ÕÑ½¥¹œ ™µÕÐÁ­Ð¤ì(€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€ÑÉ…¥¹œèéÑÉ…”„ ‰‘É½ÁÁ¥¹œ½ÕÑ½¥¹œÁ…­•Ðèí•ôˆ¤ì(€€€€€€€É•ÑÕÉ¸9½¹”ì(€€€ô((€€€±•Ð¥Á}±•¸€ôÁ­Ð¹±•¸ ¤ì(€€€±•ÐµÕÐ‘É…´€ôY•ŒèéÝ¥Ñ¡}…Á…¥Ñä¡™±½Ý}ÁÉ•™¥à¹±•¸ ¤€¬¥Á}±•¸¤ì(€€€‘É…´¹•áÑ•¹‘}™É½µ}Í±¥”¡™±½Ý}ÁÉ•™¥à¤ì(€€€‘É…´¹•áÑ•¹‘}™É½µ}Í±¥” ™Á­Ð¤ì((€€€¥˜±•ÐM½µ”¡µ…á}±•¸¤€ô½¹¸¹‘É…µ}µ…á}ÝÉ¥Ñ…‰±•}±•¸ ¤ì(€€€€€€€¥˜‘É…´¹±•¸ ¤€øµ…á}±•¸ì(€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ (€€€€€€€€€€€€€€€€‰‘…Ñ…É…´Ñ½¼±…É”™½ÈÁ••È½Á…Ñ èíô€øíôì•¹•É…Ñ¥¹œ%5@A…­•ÐQ½¼	¥œ¥˜Á½ÍÍ¥‰±”ˆ°(€€€€€€€€€€€€€€€‘É…´¹±•¸ ¤°(€€€€€€€€€€€€€€€µ…á}±•¸(€€€€€€€€€€€€¤ì(€€€€€€€€€€€¥˜±•ÐM½µ”¡¥µÁ}Á­Ð¤€ô¥µÀèé½µÁ½Í•}¥µÁ}Ñ½½}±…É” ™Á­Ð°5%9}5QT¤ì(€€€€€€€€€€€€€€€±•Ð|€ô‘•Ø¹Í•¹‘}Á…­•Ð ™¥µÁ}Á­Ð¤¹…Ý…¥Ðì(€€€€€€€€€€€ô(€€€€€€€€€€€É•ÑÕÉ¸9½¹”ì(€€€€€€€ô(€€€ô((€€€M½µ”¡Qá…Ñ…É…´ì‰åÑ•Ìè‘É…´°¥Á}±•¸ô¤)ô()™¸ÅÕ•Õ•}Ñá}‘…Ñ…É…µÌ (€€€½¹¸è€™µÕÐÅÕ¥¡”èé½¹¹•Ñ¥½¸°(€€€Ñá}ÅÕ•Õ”è€™µÕÐY••ÅÕ”ñQá…Ñ…É…´ø°(€€€ÍÑ…ÑÌè€™ÉŒñMÑ…ÑÌø°(€€€Ñá}‰ÕÉÍÑ}Á…­•ÑÌèÕÍ¥é”°(¤€´øQáAÉ½É•ÍÌì(€€€±•ÐµÕÐÁÉ½É•ÍÌ€ôQáAÉ½É•ÍÌìÅÕ•Õ•è€À°‰…­ÁÉ•ÍÍÕÉ”è™…±Í”ôì(€€€±•Ð‰Õ‘•Ð€ôÑá}‰ÕÉÍÑ}Á…­•ÑÌ¹µ…à Ä¤ì((€€€Ý¡¥±”ÁÉ½É•ÍÌ¹ÅÕ•Õ•€ð‰Õ‘•Ðì(€€€€€€€±•ÐM½µ”¡¥Ñ•´¤€ôÑá}ÅÕ•Õ”¹Á½Á}™É½¹Ð ¤•±Í”ì(€€€€€€€€€€€‰É•…¬ì(€€€€€€€ôì((€€€€€€€¥˜±•ÐM½µ”¡µ…á}±•¸¤€ô½¹¸¹‘É…µ}µ…á}ÝÉ¥Ñ…‰±•}±•¸ ¤ì(€€€€€€€€€€€¥˜¥Ñ•´¹‰åÑ•Ì¹±•¸ ¤€øµ…á}±•¸ì(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ (€€€€€€€€€€€€€€€€€€€€‰‘É½ÁÁ¥¹œ•¹½‘•QI4Ñ¡…Ð•á••‘ÌÁ••È½Á…Ñ ÝÉ¥Ñ…‰±”±•¸èíô€øíôˆ°(€€€€€€€€€€€€€€€€€€€¥Ñ•´¹‰åÑ•Ì¹±•¸ ¤°(€€€€€€€€€€€€€€€€€€€µ…á}±•¸(€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”ì(€€€€€€€€€€€ô(€€€€€€€ô((€€€€€€€€¼¼ÅÕ¥¡”èé½¹¹•Ñ¥½¸èé‘É…µ}Í•¹ ¤½Á¥•ÌÑ¡”QI4Á…å±½…¥¹Ñ¼(€€€€€€€€¼¼ÅÕ¥¡”Ì¥¹Ñ•É¹…°ÅÕ•Õ”¸]”…±É•…‘ä½Ý¸…¸•¹½‘•5MEU½ ÌQI4(€€€€€€€€¼¼Y•Œ…ÐÑ¡¥ÌÁ½¥¹Ð°Í¼ÕÍ”‘É…µ}Í•¹‘}‰Õ˜ ¤Ñ¼¡…¹½Ý¹•ÉÍ¡¥ÀÑ¼(€€€€€€€€¼¼ÅÕ¥¡”…¹…Ù½¥½¹”µ•µÁä½¸Ñ¡”ÕÁ±½…¡½ÐÁ…Ñ ¸Q¡¥Ìµ¥ÉÉ½ÉÌÑ¡”(€€€€€€€€¼¼é•É¼µ½ÁäQI4A$‘•ÍÉ¥‰•‰äÅÕ¥¡”¸(€€€€€€€¥˜½¹¸¹¥Í}‘É…µ}Í•¹‘}ÅÕ•Õ•}™Õ±° ¤ì(€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}‰…­ÁÉ•ÍÍÕÉ”¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€Ñá}ÅÕ•Õ”¹ÁÕÍ¡}™É½¹Ð¡¥Ñ•´¤ì(€€€€€€€€€€€ÁÉ½É•ÍÌ¹‰…­ÁÉ•ÍÍÕÉ”€ôÑÉÕ”ì(€€€€€€€€€€€‰É•…¬ì(€€€€€€€ô((€€€€€€€±•Ð¥Á}±•¸€ô¥Ñ•´¹¥Á}±•¸ì(€€€€€€€µ…Ñ ½¹¸¹‘É…µ}Í•¹‘}‰Õ˜¡¥Ñ•´¹‰åÑ•Ì¤ì(€€€€€€€€€€€=¬  ¤¤€ôøì(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}Á…­•ÑÌ¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}‰åÑ•Ì¹™•Ñ¡}…‘¡¥Á}±•¸…ÌÔØÐ°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€ÁÉ½É•ÍÌ¹ÅÕ•Õ•€¬ô€Äì(€€€€€€€€€€€ô(€€€€€€€€€€€ÉÈ¡ÅÕ¥¡”èéÉÉ½Èèé½¹”¤€ôøì(€€€€€€€€€€€€€€€€¼¼Q¡¥ÌÍ¡½Õ±‰”É…É”‰•…ÕÍ”Ý”¡•­•¥Í}‘É…µ}Í•¹‘}ÅÕ•Õ•}™Õ±° ¤(€€€€€€€€€€€€€€€€¼¼©ÕÍÐ…‰½Ù”¸‘É…µ}Í•¹‘}‰Õ˜ ¤½¹ÍÕµ•ÌÑ¡”‰Õ™™•È°Í¼Ý”…¹¹½Ð(€€€€€€€€€€€€€€€€¼¼Í…™•±äÉ•ÑÉäÑ¡”•á…ÐÍ…µ”½Ý¹•Y•Œ¡•É”¸½Õ¹Ð¥ÐÍ•Á…É…Ñ•±ä(€€€€€€€€€€€€€€€€¼¼…Ì‰½Ñ ‰…­ÁÉ•ÍÍÕÉ”…¹„‘É½ÀÍ¼¥Ð¥ÌÙ¥Í¥‰±”¥¸±½Ì¸(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}‰…­ÁÉ•ÍÍÕÉ”¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€ÁÉ½É•ÍÌ¹‰…­ÁÉ•ÍÍÕÉ”€ôÑÉÕ”ì(€€€€€€€€€€€€€€€‰É•…¬ì(€€€€€€€€€€€ô(€€€€€€€€€€€ÉÈ¡”¤€ôøì(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ ‰‘…Ñ…É…´Í•¹‘}‰Õ˜•ÉÉ½Èèí•ôì‘É½ÁÁ¥¹œ•¹½‘•QI4ˆ¤ì(€€€€€€€€€€€ô(€€€€€€€ô(€€€ô((€€€ÁÉ½É•ÍÌ)ô()™¸Á½±±} Ì¡½¹¸è€™µÕÐÅÕ¥¡”èé½¹¹•Ñ¥½¸° Í}½¹¸è€™µÕÐÅÕ¥¡”èé Ìèé½¹¹•Ñ¥½¸¤ì(€€€±½½Àì(€€€€€€€µ…Ñ  Í}½¹¸¹Á½±°¡½¹¸¤ì(€€€€€€€€€€€=¬¡|¤€ôøíô(€€€€€€€€€€€ÉÈ¡ÅÕ¥¡”èé ÌèéÉÉ½Èèé½¹”¤€ôø‰É•…¬°(€€€€€€€€€€€ÉÈ¡”¤€ôøì(€€€€€€€€€€€€€€€ÑÉ…¥¹œèéÝ…É¸„ ‰ ÌÁ½±°•ÉÉ½Èèí•ôˆ¤ì(€€€€€€€€€€€€€€€‰É•…¬ì(€€€€€€€€€€€ô(€€€€€€€ô(€€€ô)ô()…Íå¹Œ™¸‘É…¥¹}¥¹½µ¥¹}‘…Ñ…É…µÌ (€€€½¹¸è€™µÕÐÅÕ¥¡”èé½¹¹•Ñ¥½¸°(€€€™±½Ý}¥èÔØÐ°(€€€ÍÑ…ÑÌè€™ÉŒñMÑ…ÑÌø°(€€€‘•Øè€™ÉŒñQÕ¹IÍ•Ù¥”ø°(¤ì(€€€±½½Àì(€€€€€€€µ…Ñ ½¹¸¹‘É…µ}É•Ù}‰Õ˜ ¤ì(€€€€€€€€€€€=¬¡‘É…´¤€ôøì(€€€€€€€€€€€€€€€±•Ð‘É…µ}É•˜€ô‘É…´¹…Í}É•˜ ¤ì(€€€€€€€€€€€€€€€¥˜±•ÐM½µ”¡¥Á}Á…å±½…¤€ôÁ…ÉÍ•}‘…Ñ…É…´¡‘É…µ}É•˜°™±½Ý}¥¤ì(€€€€€€€€€€€€€€€€€€€¥˜Á…­•ÐèéÙ…±¥‘…Ñ•}¥¹½µ¥¹œ¡¥Á}Á…å±½…¤¹¥Í}½¬ ¤ì(€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Éá}Á…­•ÑÌ¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Éá}‰åÑ•Ì¹™•Ñ¡}…‘¡¥Á}Á…å±½…¹±•¸ ¤…ÌÔØÐ°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€€€€€€€€€¥˜±•ÐÉÈ¡•ÉÈ¤€ô‘•Ø¹Í•¹‘}Á…­•Ð¡¥Á}Á…å±½…¤¹…Ý…¥Ðì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ÑÉ…¥¹œèéÝ…É¸„ ‰™…¥±•Ñ¼ÝÉ¥Ñ”É••¥Ù•Á…­•ÐÑ¼QU8èí•ÉÈèôˆ¤ì(€€€€€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô(€€€€€€€€€€€ÉÈ¡ÅÕ¥¡”èéÉÉ½Èèé½¹”¤€ôø‰É•…¬°(€€€€€€€€€€€ÉÈ¡”¤€ôøì(€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ ‰‘…Ñ…É…´É•Ø•ÉÉ½Èèí•ôˆ¤ì(€€€€€€€€€€€€€€€‰É•…¬ì(€€€€€€€€€€€ô(€€€€€€€ô(€€€ô)ô()…Íå¹Œ™¸Í•¹‘}Á…­•Ñ}‘…Ñ…É…´ (€€€Í½­•Ðè€™Ñ½­¥¼èé¹•ÐèéU‘ÁM½­•Ð°(€€€•¹‘Á½¥¹ÐèM½­•Ñ‘‘È°(€€€±½…±}…‘‘ÈèM½­•Ñ‘‘È°(€€€½¹¸è€™µÕÐÅÕ¥¡”èé½¹¹•Ñ¥½¸°(€€€™±½Ý}ÁÉ•™¥àè€™mÔát°(€€€Á­Ðè€™µÕÐmÔát°(€€€ÍÑ…ÑÌè€™ÉŒñMÑ…ÑÌø°(€€€‘•Øè€™ÉŒñQÕ¹IÍ•Ù¥”ø°(€€€‰Õ˜è€™µÕÐmÔát°(€€€½ÕÐè€™µÕÐmÔát°(¤€´øI•ÍÕ±Ðð ¤øì(€€€µ…Ñ Á…­•ÐèéÁÉ•Á…É•}½ÕÑ½¥¹œ¡Á­Ð¤ì(€€€€€€€=¬¡|¤€ôøì(€€€€€€€€€€€±•ÐÁ­Ñ}±•¸€ôÁ­Ð¹±•¸ ¤…ÌÔØÐì(€€€€€€€€€€€±•ÐµÕÐ‘É…´€ôY•ŒèéÝ¥Ñ¡}…Á…¥Ñä¡™±½Ý}ÁÉ•™¥à¹±•¸ ¤€¬Á­Ð¹±•¸ ¤¤ì(€€€€€€€€€€€‘É…´¹•áÑ•¹‘}™É½µ}Í±¥”¡™±½Ý}ÁÉ•™¥à¤ì(€€€€€€€€€€€‘É…´¹•áÑ•¹‘}™É½µ}Í±¥”¡Á­Ð¤ì((€€€€€€€€€€€¥˜±•ÐM½µ”¡µ…á}±•¸¤€ô½¹¸¹‘É…µ}µ…á}ÝÉ¥Ñ…‰±•}±•¸ ¤ì(€€€€€€€€€€€€€€€¥˜‘É…´¹±•¸ ¤€øµ…á}±•¸ì(€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ (€€€€€€€€€€€€€€€€€€€€€€€€‰‘…Ñ…É…´Ñ½¼±…É”™½ÈÁ••È½Á…Ñ èíô€øíôì•¹•É…Ñ¥¹œ%5@A…­•ÐQ½¼	¥œ¥˜Á½ÍÍ¥‰±”ˆ°(€€€€€€€€€€€€€€€€€€€€€€€‘É…´¹±•¸ ¤°(€€€€€€€€€€€€€€€€€€€€€€€µ…á}±•¸(€€€€€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€€€€€€€€€¥˜±•ÐM½µ”¡¥µÁ}Á­Ð¤€ô¥µÀèé½µÁ½Í•}¥µÁ}Ñ½½}±…É”¡Á­Ð°5%9}5QT¤ì(€€€€€€€€€€€€€€€€€€€€€€€±•Ð|€ô‘•Ø¹Í•¹‘}Á…­•Ð ™¥µÁ}Á­Ð¤¹…Ý…¥Ðì(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô((€€€€€€€€€€€€¼¼5¥¸µ½ÁäÁ•¹‘¥¹œµÁ…­•ÐÁ…Ñ èÑ¡”ÍÑ•…‘äµÍÑ…Ñ”QU8É•…‘•È…±É•…‘ä(€€€€€€€€€€€€¼¼¡…¹‘ÌÑ¡”•¹½‘•QI4Y•ŒÑ¼ÅÕ¥¡”Ý¥Ñ ‘É…µ}Í•¹ ¤¸(€€€€€€€€€€€€¼¼Q¡¥ÌÁ…Ñ ¥ÌÕÍ•½¹±ä™½ÈÑ¡”Í¥¹±”Á…­•Ð…ÁÑÕÉ•Ý¡¥±”Ý…¥Ñ¥¹œ(€€€€€€€€€€€€¼¼™½ÈÉ•½¹¹•Ð°‰ÕÐ­••À¥Ð½Áäµµ¥¹¥µ…°…ÌÝ•±°¸‘É…µ}Í•¹‘}‰Õ˜ ¤(€€€€€€€€€€€€¼¼Ñ…­•Ì½Ý¹•ÉÍ¡¥À…¹…Ù½¥‘ÌÅÕ¥¡”Ì¥¹Ñ•É¹…°QI4Á…å±½…½Áä¸(€€€€€€€€€€€™½È…ÑÑ•µÁÐ¥¸€À¸¸ÔÄÉÔÄØì(€€€€€€€€€€€€€€€¥˜€…½¹¸¹¥Í}‘É…µ}Í•¹‘}ÅÕ•Õ•}™Õ±° ¤ì(€€€€€€€€€€€€€€€€€€€µ…Ñ ½¹¸¹‘É…µ}Í•¹‘}‰Õ˜¡‘É…´¤ì(€€€€€€€€€€€€€€€€€€€€€€€=¬  ¤¤€ôøì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}Á…­•ÑÌ¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}‰åÑ•Ì¹™•Ñ¡}…‘¡Á­Ñ}±•¸°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€€€€€ÉÈ¡”¤€ôøì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ ‰‘…Ñ…É…´Í•¹‘}‰Õ˜•ÉÉ½Èèí•ôì•¹•É…Ñ¥¹œ%5@A…­•ÐQ½¼	¥œ¥˜Á½ÍÍ¥‰±”ˆ¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€¥˜±•ÐM½µ”¡¥µÁ}Á­Ð¤€ô¥µÀèé½µÁ½Í•}¥µÁ}Ñ½½}±…É”¡Á­Ð°5%9}5QT¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€±•Ð|€ô‘•Ø¹Í•¹‘}Á…­•Ð ™¥µÁ}Á­Ð¤¹…Ý…¥Ðì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€€€€€€€€€É•ÑÕÉ¸=¬  ¤¤ì(€€€€€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€ô((€€€€€€€€€€€€€€€™±ÕÍ¡}ÅÕ¥Œ¡Í½­•Ð°½¹¸°½ÕÐ¤¹…Ý…¥Ðüì(€€€€€€€€€€€€€€€‘É…¥¹}Õ‘Á}¹½¹‰±½­¥¹œ¡Í½­•Ð°•¹‘Á½¥¹Ð°±½…±}…‘‘È°½¹¸°‰Õ˜¤ì((€€€€€€€€€€€€€€€¥˜½¹¸¹¥Í}±½Í• ¤ì(€€€€€€€€€€€€€€€€€€€‰…¥°„ ‰EU%½¹¹•Ñ¥½¸±½Í•Ý¡¥±”Ý…¥Ñ¥¹œ™½ÈQI4ÅÕ•Õ”ÍÁ…”ˆ¤ì(€€€€€€€€€€€€€€€ô((€€€€€€€€€€€€€€€±•ÐÝ…¥Ð€ô½¹¸(€€€€€€€€€€€€€€€€€€€€¹Ñ¥µ•½ÕÐ ¤(€€€€€€€€€€€€€€€€€€€€¹Õ¹ÝÉ…Á}½È¡ÕÉ…Ñ¥½¸èé™É½µ}µ¥±±¥Ì Ä¤¤(€€€€€€€€€€€€€€€€€€€€¹µ¥¸¡ÕÉ…Ñ¥½¸èé™É½µ}µ¥±±¥Ì È¤¤ì(€€€€€€€€€€€€€€€Ñ½­¥¼èéÍ•±•Ð„ì(€€€€€€€€€€€€€€€€€€€É•ÍÕ±Ð€ôÍ½­•Ð¹É•Ø¡‰Õ˜¤€ôøì(€€€€€€€€€€€€€€€€€€€€€€€±•Ð±•¸€ôÉ•ÍÕ±Ðüì(€€€€€€€€€€€€€€€€€€€€€€€±•ÐÉ•Ù}¥¹™¼€ôÅÕ¥¡”èéI•Ù%¹™¼ìÑ¼è±½…±}…‘‘È°™É½´è•¹‘Á½¥¹Ðôì(€€€€€€€€€€€€€€€€€€€€€€€¥˜±•ÐÉÈ¡”¤€ô½¹¸¹É•Ø ™µÕÐ‰Õ™l¸¹±•¹t°É•Ù}¥¹™¼¤ì(€€€€€€€€€€€€€€€€€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ ‰EU%É•ØÝ¡¥±”…ÁÁ±å¥¹œQI4‰…­ÁÉ•ÍÍÕÉ”™…¥±•èí•ôˆ¤ì(€€€€€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€€ ¤€ôÑ½­¥¼èéÑ¥µ”èéÍ±••À¡Ý…¥Ð¤€ôø½¹¸¹½¹}Ñ¥µ•½ÕÐ ¤°(€€€€€€€€€€€€€€€ô((€€€€€€€€€€€€€€€¥˜…ÑÑ•µÁÐ€ø€À€˜˜…ÑÑ•µÁÐ€”€ØÐ€ôô€Àì(€€€€€€€€€€€€€€€€€€€ÑÉ…¥¹œèéÑÉ…”„ (€€€€€€€€€€€€€€€€€€€€€€€€‰Ý…¥Ñ¥¹œ™½ÈQI4ÅÕ•Õ”ÍÁ…”è…ÑÑ•µÁÐõíôÅÕ•Õ•}±•¸õíôÅÕ•Õ•}‰åÑ•Ìõíôˆ°(€€€€€€€€€€€€€€€€€€€€€€€…ÑÑ•µÁÐ°(€€€€€€€€€€€€€€€€€€€€€€€½¹¸¹‘É…µ}Í•¹‘}ÅÕ•Õ•}±•¸ ¤°(€€€€€€€€€€€€€€€€€€€€€€€½¹¸¹‘É…µ}Í•¹‘}ÅÕ•Õ•}‰åÑ•}Í¥é” ¤(€€€€€€€€€€€€€€€€€€€€¤ì(€€€€€€€€€€€€€€€ô(€€€€€€€€€€€ô((€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€ÑÉ…¥¹œèéÑÉ…”„ ‰‘…Ñ…É…´Í•¹ÅÕ•Õ”ÍÑ…å•™Õ±°…™Ñ•È‰…­ÁÉ•ÍÍÕÉ”É•ÑÉ¥•Ì°‘É½ÁÁ¥¹œÁ…­•Ðˆ¤ì(€€€€€€€€€€€=¬  ¤¤(€€€€€€€ô(€€€€€€€ÉÈ¡”¤€ôøì(€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹™•Ñ¡}…‘ Ä°=É‘•É¥¹œèéI•±…á•¤ì(€€€€€€€€€€€ÑÉ…¥¹œèéÑÉ…”„ ‰‘É½ÁÁ¥¹œ½ÕÑ½¥¹œÁ…­•Ðèí•ôˆ¤ì(€€€€€€€€€€€=¬  ¤¤(€€€€€€€ô(€€€ô)ô()™¸‘É…¥¹}Õ‘Á}¹½¹‰±½­¥¹œ (€€€Í½­•Ðè€™Ñ½­¥¼èé¹•ÐèéU‘ÁM½­•Ð°(€€€•¹‘Á½¥¹ÐèM½­•Ñ‘‘È°(€€€±½…±}…‘‘ÈèM½­•Ñ‘‘È°(€€€½¹¸è€™µÕÐÅÕ¥¡”èé½¹¹•Ñ¥½¸°(€€€‰Õ˜è€™µÕÐmÔát°(¤€´ø‰½½°ì(€€€±•ÐµÕÐÉ••¥Ù•€ô™…±Í”ì(€€€Ý¡¥±”±•Ð=¬¡±•¸¤€ôÍ½­•Ð¹ÑÉå}É•Ø¡‰Õ˜¤ì(€€€€€€€É••¥Ù•€ôÑÉÕ”ì(€€€€€€€±•ÐÉ•Ù}¥¹™¼€ôÅÕ¥¡”èéI•Ù%¹™¼ìÑ¼è±½…±}…‘‘È°™É½´è•¹‘Á½¥¹Ðôì(€€€€€€€¥˜±•ÐÉÈ¡”¤€ô½¹¸¹É•Ø ™µÕÐ‰Õ™l¸¹±•¹t°É•Ù}¥¹™¼¤ì(€€€€€€€€€€€ÑÉ…¥¹œèé‘•‰Õœ„ ‰EU%É•Ø•ÉÉ½ÈÝ¡¥±”‘É…¥¹¥¹œU@èí•ôˆ¤ì(€€€€€€€ô(€€€ô(€€€É••¥Ù•)ô()…Íå¹Œ™¸™±ÕÍ¡}ÅÕ¥Œ (€€€Í½­•Ðè€™Ñ½­¥¼èé¹•ÐèéU‘ÁM½­•Ð°(€€€½¹¸è€™µÕÐÅÕ¥¡”èé½¹¹•Ñ¥½¸°(€€€½ÕÐè€™µÕÐmÔát°(¤€´øI•ÍÕ±Ðð ¤øì(€€€±½½Àì(€€€€€€€µ…Ñ ½¹¸¹Í•¹¡½ÕÐ¤ì(€€€€€€€€€€€=¬ ¡ÝÉ¥Ñ”°Í•¹‘}¥¹™¼¤¤€ôøì(€€€€€€€€€€€€€€€±•Ð|€ôÍ•¹‘}¥¹™¼ì(€€€€€€€€€€€€€€€Í½­•Ð¹Í•¹ ™½ÕÑl¸¹ÝÉ¥Ñ•t¤¹…Ý…¥Ðüì(€€€€€€€€€€€ô(€€€€€€€€€€€ÉÈ¡ÅÕ¥¡”èéÉÉ½Èèé½¹”¤€ôø‰É•…¬°(€€€€€€€€€€€ÉÈ¡”¤€ôø‰…¥°„ ‰ÅÕ¥ŒÍ•¹•ÉÉ½Èèí•ôˆ¤°(€€€€€€€ô(€€€ô(€€€=¬  ¤¤)ô()™¸‰Õ¥±‘}™±½Ý}ÁÉ•™¥à¡™±½Ý}¥èÔØÐ¤€´øI•ÍÕ±ÐñY•ŒñÔàøøì(€€€±•ÐµÕÐÑµÀ€ôlÁÔàì€átì(€€€±•ÐµÕÐˆ€ô=Ñ•ÑÍ5ÕÐèéÝ¥Ñ¡}Í±¥” ™µÕÐÑµÀ¤ì(€€€ˆ¹ÁÕÑ}Ù…É¥¹Ð¡™±½Ý}¥¤¹µ…Á}•ÉÈ¡ñ•ð…¹å¡½Ü„ ‰•¹½‘”™±½Ý}¥Ù…É¥¹Ðèí•ôˆ¤¤üì(€€€±•Ð±•¸€ôˆ¹½™˜ ¤ì(€€€±•ÐµÕÐ™±½Ý}ÁÉ•™¥à€ôY•ŒèéÝ¥Ñ¡}…Á…¥Ñä¡±•¸€¬€Ä¤ì(€€€™±½Ý}ÁÉ•™¥à¹•áÑ•¹‘}™É½µ}Í±¥” ™ÑµÁl¸¹±•¹t¤ì(€€€™±½Ý}ÁÉ•™¥à¹ÁÕÍ  ÁàÀÀ¤ì(€€€=¬¡™±½Ý}ÁÉ•™¥à¤)ô()™¸Á…ÉÍ•}‘…Ñ…É…´¡‘É…´è€™mÔát°•áÁ•Ñ•‘}™±½Ý}¥èÔØÐ¤€´ø=ÁÑ¥½¸ð™mÔátøì(€€€±•ÐµÕÐˆ€ô=Ñ•ÑÌèéÝ¥Ñ¡}Í±¥”¡‘É…´¤ì(€€€±•Ð™±½Ý}¥€ôˆ¹•Ñ}Ù…É¥¹Ð ¤¹½¬ ¤üì(€€€¥˜™±½Ý}¥€„ô•áÁ•Ñ•‘}™±½Ý}¥ì(€€€€€€€É•ÑÕÉ¸9½¹”ì(€€€ô(€€€±•Ð½¹Ñ•áÑ}¥€ôˆ¹•Ñ}Ù…É¥¹Ð ¤¹½¬ ¤üì(€€€¥˜½¹Ñ•áÑ}¥€„ô€Àì(€€€€€€€É•ÑÕÉ¸9½¹”ì(€€€ô(€€€±•Ð½™˜€ôˆ¹½™˜ ¤ì(€€€¥˜½™˜€øô‘É…´¹±•¸ ¤ì(€€€€€€€É•ÑÕÉ¸9½¹”ì(€€€ô(€€€M½µ” ™‘É…µm½™˜¸¹t¤)ô()™¸­••Á…±¥Ù•}É•µ…¥¹¥¹œ¡Á•É¥½èÕÉ…Ñ¥½¸°¥‘±•}™½ÈèÕÉ…Ñ¥½¸¤€´ø=ÁÑ¥½¸ñÕÉ…Ñ¥½¸øì(€€€¥˜Á•É¥½¹¥Í}é•É¼ ¤ì(€€€€€€€9½¹”(€€€ô•±Í”ì(€€€€€€€M½µ”¡Á•É¥½¹Í…ÑÕÉ…Ñ¥¹}ÍÕˆ¡¥‘±•}™½È¤¤(€€€ô)ô()™¸ÍÁ…Ý¹}ÍÑ…ÑÍ}Ñ…Í¬¡ÍÑ…ÑÌèÉŒñMÑ…ÑÌø°ÍÑ…ÉÐè%¹ÍÑ…¹Ð¤€´øÑ½­¥¼èéÑ…Í¬èé)½¥¹!…¹‘±”ð ¤øì(€€€Ñ½­¥¼èéÍÁ…Ý¸¡…Íå¹Œµ½Ù”ì(€€€€€€€±•ÐµÕÐ¥¹Ñ•ÉÙ…°€ôÑ½­¥¼èéÑ¥µ”èé¥¹Ñ•ÉÙ…°¡ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÄÀ¤¤ì(€€€€€€€±½½Àì(€€€€€€€€€€€¥¹Ñ•ÉÙ…°¹Ñ¥¬ ¤¹…Ý…¥Ðì(€€€€€€€€€€€ÑÉ…¥¹œèé¥¹™¼„ (€€€€€€€€€€€€€€€€‰½¹¹•Ñ•õíôÑàõíô€¡íô¤Éàõíô€¡íô¤‘É½ÀõíôÑáÄõíô‰Àõíô±½ÍÐõíôÉ•ÑÉ…¹Ìõíôˆ°(€€€€€€€€€€€€€€€™½Éµ…Ñ}‘ÕÉ…Ñ¥½¸¡ÍÑ…ÉÐ¹•±…ÁÍ• ¤¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}Á…­•ÑÌ¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€€€€™½Éµ…Ñ}‰åÑ•Ì¡ÍÑ…ÑÌ¹Ñá}‰åÑ•Ì¹±½…¡=É‘•É¥¹œèéI•±…á•¤¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Éá}Á…­•ÑÌ¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€€€€™½Éµ…Ñ}‰åÑ•Ì¡ÍÑ…ÑÌ¹Éá}‰åÑ•Ì¹±½…¡=É‘•É¥¹œèéI•±…á•¤¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹‘É½ÁÁ•¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}ÅÕ•Õ•}±•¸¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹Ñá}‰…­ÁÉ•ÍÍÕÉ”¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹ÅÕ¥}±½ÍÐ¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€€€€ÍÑ…ÑÌ¹ÅÕ¥}É•ÑÉ…¹Ì¹±½…¡=É‘•É¥¹œèéI•±…á•¤°(€€€€€€€€€€€€¤ì(€€€€€€€ô(€€€ô¤)ô()™¸™½Éµ…Ñ}‰åÑ•Ì¡‰åÑ•ÌèÔØÐ¤€´øMÑÉ¥¹œì(€€€½¹ÍÐ-%èÔØÐ€ô€ÄÀÈÐì(€€€½¹ÍÐ5%èÔØÐ€ô€ÄÀÈÐ€¨-%ì(€€€½¹ÍÐ%èÔØÐ€ô€ÄÀÈÐ€¨5%ì(€€€¥˜‰åÑ•Ì€øô%ì(€€€€€€€™½Éµ…Ð„ ‰ìè¸Åô¥ˆ°‰åÑ•Ì…Ì˜ØÐ€¼%…Ì˜ØÐ¤(€€€ô•±Í”¥˜‰åÑ•Ì€øô5%ì(€€€€€€€™½Éµ…Ð„ ‰ìè¸Åô5¥ˆ°‰åÑ•Ì…Ì˜ØÐ€¼5%…Ì˜ØÐ¤(€€€ô•±Í”¥˜‰åÑ•Ì€øô-%ì(€€€€€€€™½Éµ…Ð„ ‰ìè¸Åô-¥ˆ°‰åÑ•Ì…Ì˜ØÐ€¼-%…Ì˜ØÐ¤(€€€ô•±Í”ì(€€€€€€€™½Éµ…Ð„ ‰í‰åÑ•Íôˆ¤(€€€ô)ô()™¸™½Éµ…Ñ}‘ÕÉ…Ñ¥½¸¡èÕÉ…Ñ¥½¸¤€´øMÑÉ¥¹œì(€€€±•ÐÍ•Ì€ô¹…Í}Í•Ì ¤ì(€€€¥˜Í•Ì€ð€ØÀì(€€€€€€€™½Éµ…Ð„ ‰íÍ•ÍõÌˆ¤(€€€ô•±Í”¥˜Í•Ì€ð€ÌØÀÀì(€€€€€€€™½Éµ…Ð„ ‰íõ´ìèÀÉõÌˆ°Í•Ì€¼€ØÀ°Í•Ì€”€ØÀ¤(€€€ô•±Í”ì(€€€€€€€™½Éµ…Ð„ ‰íõ ìèÀÉõ´ìèÀÉõÌˆ°Í•Ì€¼€ÌØÀÀ°€¡Í•Ì€”€ÌØÀÀ¤€¼€ØÀ°Í•Ì€”€ØÀ¤(€€€ô)ô((m™œ¡Ñ•ÍÐ¥t)µ½Ñ•ÍÑÌì(€€€ÕÍ”ÍÕÁ•Èèè¨ì((€€€€mÑ•ÍÑt(€€€™¸­••Á…±¥Ù•}…¹}‰•}‘¥Í…‰±• ¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„ (€€€€€€€€€€€­••Á…±¥Ù•}É•µ…¥¹¥¹œ¡ÕÉ…Ñ¥½¸èéiI<°ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ØÀ¤¤°(€€€€€€€€€€€9½¹”(€€€€€€€€¤ì(€€€ô((€€€€mÑ•ÍÑt(€€€™¸­••Á…±¥Ù•}Ý…¥ÑÍ}½¹±å}™½É}É•µ…¥¹¥¹}¥‘±•}Ñ¥µ” ¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„ (€€€€€€€€€€€­••Á…±¥Ù•}É•µ…¥¹¥¹œ¡ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÈÔ¤°ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÄÀ¤¤°(€€€€€€€€€€€M½µ”¡ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÄÔ¤¤(€€€€€€€€¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„ (€€€€€€€€€€€­••Á…±¥Ù•}É•µ…¥¹¥¹œ¡ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÈÔ¤°ÕÉ…Ñ¥½¸èé™É½µ}Í•Ì ÈÔ¤¤°(€€€€€€€€€€€M½µ”¡ÕÉ…Ñ¥½¸èéiI<¤(€€€€€€€€¤ì(€€€ô((€€€™¸•¹½‘•}Ù…É¥¹Ð¡Ù…°èÔØÐ¤€´øY•ŒñÔàøì(€€€€€€€±•ÐµÕÐÑµÀ€ôlÁÔàì€átì(€€€€€€€±•ÐµÕÐˆ€ô=Ñ•ÑÍ5ÕÐèéÝ¥Ñ¡}Í±¥” ™µÕÐÑµÀ¤ì(€€€€€€€ˆ¹ÁÕÑ}Ù…É¥¹Ð¡Ù…°¤¹Õ¹ÝÉ…À ¤ì(€€€€€€€ÑµÁl¸¹ˆ¹½™˜ ¥t¹Ñ½}Ù•Œ ¤(€€€ô((€€€€mÑ•ÍÑt(€€€™¸Á…ÉÍ•}‘…Ñ…É…µ}Ù…±¥ ¤ì(€€€€€€€±•ÐµÕÐ€ô•¹½‘•}Ù…É¥¹Ð Ð¤ì(€€€€€€€¹•áÑ•¹‘}™É½µ}Í±¥” ™•¹½‘•}Ù…É¥¹Ð À¤¤ì(€€€€€€€¹•áÑ•¹‘}™É½µ}Í±¥”¡ˆ‰Á…å±½…ˆ¤ì(€€€€€€€…ÍÍ•ÉÑ}•Ä„¡Á…ÉÍ•}‘…Ñ…É…´ ™°€Ð¤°M½µ”¡ˆ‰Á…å±½…ˆ¹…Í}É•˜ ¤¤¤ì(€€€ô)ô
