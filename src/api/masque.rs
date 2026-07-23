@@ -1,6 +1,6 @@
 use crate::api::hooks::run_hook;
 use crate::api::{icmp, packet};
-use crate::config::{AppConfig, EndpointAddr};
+use crate::config::{AppConfig, MasqueEndpoint};
 use crate::native_tun::TunRsDevice;
 use anyhow::{anyhow, bail, Context, Result};
 use octets::{Octets, OctetsMut};
@@ -31,10 +31,9 @@ const MAX_UDP_BATCH_SIZE: usize = 64;
 #[derive(Clone)]
 pub struct MasqueConfig {
     pub private_key: SecretKey,
-    pub endpoint_pub_key_spki_der: Vec<u8>,
     pub sni: String,
     pub insecure: bool,
-    pub endpoint: EndpointAddr,
+    pub endpoints: Vec<MasqueEndpoint>,
     pub keepalive_period: Duration,
     pub initial_packet_size: u16,
     pub cc_algorithm: String,
@@ -386,10 +385,6 @@ fn recvmmsg_nonblocking(
     Ok(result as usize)
 }
 
-fn endpoint_socket(endpoint: &EndpointAddr) -> SocketAddr {
-    endpoint.0
-}
-
 fn create_connected_udp_socket(endpoint: SocketAddr, socket_buffer_size: usize) -> Result<tokio::net::UdpSocket> {
     let domain = if endpoint.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let bind_addr: SocketAddr = if endpoint.is_ipv4() {
@@ -430,6 +425,7 @@ pub async fn maintain_native_tun(
     mtu: usize,
 ) -> Result<()> {
     let mut pending_pkt: Option<Vec<u8>> = None;
+    let mut endpoint_index = 0usize;
 
     loop {
         if !cfg.always_reconnect && pending_pkt.is_none() {
@@ -444,16 +440,34 @@ pub async fn maintain_native_tun(
             tracing::info!("Detected outbound activity ({n} bytes). Connecting...");
         }
 
-        tracing::info!("Establishing MASQUE connection to {}", cfg.endpoint);
-        match run_tunnel_session(&cfg, &dev, mtu, &mut pending_pkt).await {
+        let endpoint = cfg
+            .endpoints
+            .get(endpoint_index)
+            .ok_or_else(|| anyhow!("MASQUE endpoint list is empty"))?;
+        tracing::info!(
+            "Establishing MASQUE connection to {} ({}/{}){}",
+            endpoint.addr,
+            endpoint_index + 1,
+            cfg.endpoints.len(),
+            if endpoint.host.is_empty() {
+                String::new()
+            } else {
+                format!(" for {}", endpoint.host)
+            }
+        );
+        match run_tunnel_session(&cfg, endpoint, &dev, mtu, &mut pending_pkt).await {
             Ok(()) => tracing::warn!("MASQUE session ended. Reconnecting..."),
             Err(err) => tracing::warn!("MASQUE session failed: {err:#}. Reconnecting..."),
         }
+        endpoint_index = (endpoint_index + 1) % cfg.endpoints.len();
         tokio::time::sleep(cfg.reconnect_delay).await;
     }
 }
 
-fn prepare_tls_material(cfg: &MasqueConfig) -> Result<TlsMaterial> {
+fn prepare_tls_material(
+    cfg: &MasqueConfig,
+    endpoint: &MasqueEndpoint,
+) -> Result<TlsMaterial> {
     let key_pem = cfg
         .private_key
         .to_pkcs8_pem(LineEnding::LF)
@@ -483,7 +497,7 @@ fn prepare_tls_material(cfg: &MasqueConfig) -> Result<TlsMaterial> {
     Ok(TlsMaterial {
         cert_pem_file,
         key_pem_file,
-        endpoint_pub_key_spki_der: cfg.endpoint_pub_key_spki_der.clone(),
+        endpoint_pub_key_spki_der: endpoint.endpoint_pub_key_spki_der.clone(),
     })
 }
 
@@ -497,12 +511,13 @@ fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {
 
 async fn run_tunnel_session(
     cfg: &MasqueConfig,
+    selected_endpoint: &MasqueEndpoint,
     dev: &Arc<TunRsDevice>,
     mtu: usize,
     pending_pkt: &mut Option<Vec<u8>>,
 ) -> Result<()> {
-    let endpoint = endpoint_socket(&cfg.endpoint);
-    let tls_material = prepare_tls_material(cfg)?;
+    let endpoint = selected_endpoint.addr.0;
+    let tls_material = prepare_tls_material(cfg, selected_endpoint)?;
 
     let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| anyhow!("quiche config: {e}"))?;

@@ -62,8 +62,11 @@ pub struct EnrollArgs {
 
 #[derive(Debug, Args)]
 pub struct NativeTunArgs {
-    #[arg(short = 'P', long, default_value_t = 443)]
+    /// Override the Cloudflare MASQUE endpoint port. 0 uses the API-provided
+    /// port list, falling back to 443 for legacy configurations.
+    #[arg(short = 'P', long, default_value_t = 0)]
     pub connect_port: u16,
+    /// Prefer an IPv6 MASQUE endpoint while retaining IPv4 as fallback.
     #[arg(short = '6', long)]
     pub ipv6: bool,
     #[arg(short = 'F', long)]
@@ -241,7 +244,8 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         );
     }
 
-    let endpoint = config::select_endpoint_from_config(&cfg, args.ipv6, args.connect_port)?;
+    let endpoints =
+        config::select_endpoints_from_config(&cfg, args.ipv6, args.connect_port)?;
     if args.insecure {
         config::warn_insecure();
     }
@@ -271,10 +275,9 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
 
     let masque = MasqueConfig {
         private_key: cfg.get_ec_private_key()?,
-        endpoint_pub_key_spki_der: cfg.get_ec_endpoint_public_key_der()?,
         sni: args.sni_address,
         insecure: args.insecure,
-        endpoint,
+        endpoints,
         keepalive_period: args.keepalive_period,
         initial_packet_size: args.initial_packet_size,
         cc_algorithm: args.cc,
@@ -321,6 +324,22 @@ fn build_app_config(account: &AccountData, private_key_der: &[u8], access_token:
         access_token: access_token.to_string(),
         ipv4: account.config.interface.addresses.v4.clone(),
         ipv6: account.config.interface.addresses.v6.clone(),
+        masque_peers: account
+            .config
+            .peers
+            .iter()
+            .map(|peer| config::MasquePeerConfig {
+                endpoint_v4: config::endpoint_v4_from_account_value(
+                    &peer.endpoint.v4,
+                ),
+                endpoint_v6: config::endpoint_v6_from_account_value(
+                    &peer.endpoint.v6,
+                ),
+                endpoint_host: peer.endpoint.host.clone(),
+                ports: peer.endpoint.ports.clone(),
+                endpoint_pub_key: peer.public_key.clone(),
+            })
+            .collect(),
     })
 }
 
