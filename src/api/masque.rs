@@ -197,11 +197,15 @@ impl UdpBatchIo {
             let fd = socket.as_raw_fd();
             let mut sent = start;
             while sent < end {
-                match sendmmsg_nonblocking(
-                    fd,
-                    &self.tx_buffers[sent..end],
-                    &self.tx_lens[sent..end],
-                ) {
+                // Keep raw sendmmsg() synchronized with Tokio's writable
+                // readiness state for the same reason as recvmmsg() below.
+                match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    sendmmsg_nonblocking(
+                        fd,
+                        &self.tx_buffers[sent..end],
+                        &self.tx_lens[sent..end],
+                    )
+                }) {
                     Ok(0) => {
                         socket.writable().await?;
                     }
@@ -577,9 +581,7 @@ async fn run_tunnel_session(
         .clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
     let tx_queue_len = cfg.tx_queue_len.max(1).min(packet_buffer_pool_size);
     tracing::info!(
-        "QUIC tuning: quiche=0.29 cc={} initial_cwnd_packets={} udp_payload={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
-        cfg.cc_algorithm.trim(),
-        cfg.initial…2589 tokens truncated…                }
+        "QUIC tuning: quiche=0.29 cc={} initial_cwnd_packets={} udp_payl…2653 tokens truncated…                }
 
                     let tx_dgram = TxDatagram {
                         bytes: dgram,
