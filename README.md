@@ -70,6 +70,8 @@ The application configures interface addresses and MTU, but does not manage the 
 
 | Parameter | Default | Notes |
 | --- | ---: | --- |
+| `--connect-port` | `0` | Uses Cloudflare's API-provided endpoint ports; legacy configs fall back to `443`. A non-zero value overrides every endpoint port |
+| `--ipv6` | off | Prefers an IPv6 MASQUE endpoint while retaining IPv4 as fallback |
 | `--mtu` | `1200` | Reduced loss and jitter on the tested MASQUE path |
 | `--initial-packet-size` | `1250` | Leaves room for QUIC/MASQUE overhead |
 | `--tx-queue-len` | `8192` | Decouples the TUN reader from QUIC pacing |
@@ -117,6 +119,12 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
 - `tun-rs` remains on its supported native FreeBSD async path. Its
   `recv_multiple`/`send_multiple`, GRO and offload APIs are Linux-only and are
   intentionally not emulated here.
+- New registrations retain every Cloudflare MASQUE peer, IPv4/IPv6 address,
+  endpoint hostname, port and peer-specific pin. Reconnects rotate through the
+  ordered endpoint list. Existing configurations remain valid and use port 443
+  when they do not contain an API port list.
+- Endpoint fallback is transport-only. DNS policy, routing and firewall state
+  remain owned by the host BSD system.
 - The FreeBSD raw TUN direction is documented but is not enabled by default; `tun-rs` remains the production backend.
 - See [FreeBSD raw TUN notes](docs/FREEBSD_RAW_TUN_NOTES.md) for the current design considerations.
 
