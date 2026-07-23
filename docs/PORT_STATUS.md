@@ -16,6 +16,12 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 - Basic ICMP Packet Too Big generation included for datagram send errors.
 - Configurable, inactivity-aware RFC 9000 QUIC PING keepalive included
   (`25s` by default, `0s` disables it).
+- Bounded reusable upload buffer pool included (`1024` buffers by default).
+- FreeBSD UDP send/receive batching included with native
+  `sendmmsg`/`recvmmsg` (`32` packets per syscall by default).
+- Outbound batches retain quiche's per-packet pacing deadline.
+- The MASQUE wire format remains unchanged; batching is below QUIC at the UDP
+  socket boundary.
 - Reconnect loop and connect/disconnect hooks included.
 
 ## Removed

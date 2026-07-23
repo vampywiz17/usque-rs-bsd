@@ -109,6 +109,14 @@ pub struct NativeTunArgs {
     /// FreeBSD tests showed 256 is a better default than 128 for upload throughput.
     #[arg(long, default_value_t = 256)]
     pub tx_burst_packets: usize,
+    /// Number of reusable packet buffers shared by the TUN reader and MASQUE
+    /// sender. This bounds upload buffering without allocating per packet.
+    #[arg(long, default_value_t = 1024)]
+    pub packet_buffer_pool_size: usize,
+    /// Maximum UDP datagrams sent or received by one FreeBSD mmsg syscall.
+    /// Other platforms retain the portable Tokio fallback.
+    #[arg(long, default_value_t = 32)]
+    pub udp_batch_size: usize,
     /// Do not set up IP addresses and do not set the link up.
     #[arg(short = 'I', long)]
     pub no_iproute2: bool,
@@ -278,6 +286,8 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         udp_socket_buffer: args.udp_socket_buffer,
         tx_queue_len: args.tx_queue_len,
         tx_burst_packets: args.tx_burst_packets,
+        packet_buffer_pool_size: args.packet_buffer_pool_size,
+        udp_batch_size: args.udp_batch_size,
         reconnect_delay: args.reconnect_delay,
         always_reconnect: args.always_reconnect,
         on_connect: non_empty(args.on_connect),

@@ -14,6 +14,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
+#[cfg(target_os = "freebsd")]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
@@ -23,6 +25,8 @@ const MIN_MTU: u16 = 1280;
 const DEFAULT_UDP_SOCKET_BUFFER: usize = 8 * 1024 * 1024;
 const DGRAM_QUEUE_LEN: usize = 16_384;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
+const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
+const MAX_UDP_BATCH_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub struct MasqueConfig {
@@ -42,6 +46,8 @@ pub struct MasqueConfig {
     pub udp_socket_buffer: usize,
     pub tx_queue_len: usize,
     pub tx_burst_packets: usize,
+    pub packet_buffer_pool_size: usize,
+    pub udp_batch_size: usize,
     pub reconnect_delay: Duration,
     pub always_reconnect: bool,
     pub on_connect: Option<String>,
@@ -85,12 +91,299 @@ impl Stats {
 
 struct TxDatagram {
     bytes: Vec<u8>,
+    wire_len: usize,
     ip_len: usize,
 }
 
 struct TxProgress {
     queued: usize,
     backpressure: bool,
+}
+
+struct UdpBatchIo {
+    tx_buffers: Vec<Vec<u8>>,
+    tx_lens: Vec<usize>,
+    tx_at: Vec<Instant>,
+    rx_buffers: Vec<Vec<u8>>,
+    batch_size: usize,
+}
+
+impl UdpBatchIo {
+    fn new(datagram_size: usize, requested_batch_size: usize) -> Self {
+        let batch_size = requested_batch_size.clamp(1, MAX_UDP_BATCH_SIZE);
+        let datagram_size = datagram_size.max(MAX_DATAGRAM_SIZE);
+        Self {
+            tx_buffers: (0..batch_size)
+                .map(|_| vec![0u8; datagram_size])
+                .collect(),
+            tx_lens: vec![0; batch_size],
+            tx_at: vec![Instant::now(); batch_size],
+            rx_buffers: (0..batch_size)
+                .map(|_| vec![0u8; datagram_size])
+                .collect(),
+            batch_size,
+        }
+    }
+
+    async fn flush_quic(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        conn: &mut quiche::Connection,
+    ) -> Result<()> {
+        loop {
+            let mut count = 0;
+            let mut drained = false;
+
+            while count < self.batch_size {
+                match conn.send(&mut self.tx_buffers[count]) {
+                    Ok((write, send_info)) => {
+                        // quiche has already produced a complete UDP datagram.
+                        // Batching only changes how ready datagrams cross the
+                        // userspace/kernel boundary.
+                        self.tx_lens[count] = write;
+                        self.tx_at[count] = send_info.at;
+                        count += 1;
+                    }
+                    Err(quiche::Error::Done) => {
+                        drained = true;
+                        break;
+                    }
+                    Err(e) => bail!("quic send error: {e}"),
+                }
+            }
+
+            if count > 0 {
+                self.send_paced_batches(socket, count).await?;
+            }
+            if drained {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn send_paced_batches(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        count: usize,
+    ) -> Result<()> {
+        let mut start = 0;
+        while start < count {
+            let wait = self.tx_at[start].saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+
+            // Preserve quiche's pacing decision: only coalesce packets whose
+            // requested send time has arrived. Equal/deadline-ready packets
+            // still cross into the kernel with one sendmmsg call on FreeBSD.
+            let now = Instant::now();
+            let mut end = start + 1;
+            while end < count && self.tx_at[end] <= now {
+                end += 1;
+            }
+            self.send_batch(socket, start, end).await?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    async fn send_batch(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
+        #[cfg(target_os = "freebsd")]
+        {
+            let fd = socket.as_raw_fd();
+            let mut sent = start;
+            while sent < end {
+                match sendmmsg_nonblocking(
+                    fd,
+                    &self.tx_buffers[sent..end],
+                    &self.tx_lens[sent..end],
+                ) {
+                    Ok(0) => {
+                        socket.writable().await?;
+                    }
+                    Ok(n) => sent += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        socket.writable().await?;
+                    }
+                    Err(err) => return Err(err).context("FreeBSD sendmmsg failed"),
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            for index in start..end {
+                socket
+                    .send(&self.tx_buffers[index][..self.tx_lens[index]])
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    fn drain_quic(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        endpoint: SocketAddr,
+        local_addr: SocketAddr,
+        conn: &mut quiche::Connection,
+    ) -> Result<usize> {
+        let mut total = 0;
+        loop {
+            let count = self.try_recv_batch(socket)?;
+            if count == 0 {
+                return Ok(total);
+            }
+            total += count;
+
+            for index in 0..count {
+                let len = self.tx_lens[index];
+                if len == 0 {
+                    continue;
+                }
+                let recv_info = quiche::RecvInfo {
+                    to: local_addr,
+                    from: endpoint,
+                };
+                if let Err(err) =
+                    conn.recv(&mut self.rx_buffers[index][..len], recv_info)
+                {
+                    tracing::debug!("QUIC recv error while draining UDP batch: {err}");
+                }
+            }
+
+            if count < self.batch_size {
+                return Ok(total);
+            }
+        }
+    }
+
+    fn try_recv_batch(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+    ) -> std::io::Result<usize> {
+        #[cfg(target_os = "freebsd")]
+        {
+            return recvmmsg_nonblocking(
+                socket.as_raw_fd(),
+                &mut self.rx_buffers,
+                &mut self.tx_lens,
+            );
+        }
+
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            let mut count = 0;
+            while count < self.batch_size {
+                match socket.try_recv(&mut self.rx_buffers[count]) {
+                    Ok(len) => {
+                        self.tx_lens[count] = len;
+                        count += 1;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(count)
+        }
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn sendmmsg_nonblocking(
+    fd: std::os::fd::RawFd,
+    buffers: &[Vec<u8>],
+    lengths: &[usize],
+) -> std::io::Result<usize> {
+    let count = buffers.len().min(lengths.len()).min(MAX_UDP_BATCH_SIZE);
+    let mut iovecs: [libc::iovec; MAX_UDP_BATCH_SIZE] =
+        std::array::from_fn(|_| libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+    let mut messages: [libc::mmsghdr; MAX_UDP_BATCH_SIZE] =
+        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+
+    for index in 0..count {
+        iovecs[index].iov_base = buffers[index].as_ptr() as *mut libc::c_void;
+        iovecs[index].iov_len = lengths[index];
+        messages[index].msg_hdr.msg_iov = &mut iovecs[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+
+    let result = unsafe {
+        libc::sendmmsg(
+            fd,
+            messages.as_mut_ptr(),
+            count as _,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn recvmmsg_nonblocking(
+    fd: std::os::fd::RawFd,
+    buffers: &mut [Vec<u8>],
+    lengths: &mut [usize],
+) -> std::io::Result<usize> {
+    let count = buffers.len().min(lengths.len()).min(MAX_UDP_BATCH_SIZE);
+    let mut iovecs: [libc::iovec; MAX_UDP_BATCH_SIZE] =
+        std::array::from_fn(|_| libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+    let mut messages: [libc::mmsghdr; MAX_UDP_BATCH_SIZE] =
+        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+
+    for index in 0..count {
+        iovecs[index].iov_base =
+            buffers[index].as_mut_ptr() as *mut libc::c_void;
+        iovecs[index].iov_len = buffers[index].len();
+        messages[index].msg_hdr.msg_iov = &mut iovecs[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+
+    let result = unsafe {
+        libc::recvmmsg(
+            fd,
+            messages.as_mut_ptr(),
+            count as _,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if result < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(0);
+        }
+        return Err(err);
+    }
+
+    for index in 0..result as usize {
+        if messages[index].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
+            lengths[index] = 0;
+            tracing::debug!("dropping truncated UDP datagram from recvmmsg batch");
+        } else {
+            lengths[index] =
+                (messages[index].msg_len as usize).min(buffers[index].len());
+        }
+    }
+    Ok(result as usize)
 }
 
 fn endpoint_socket(endpoint: &EndpointAddr) -> SocketAddr {
@@ -256,14 +549,20 @@ async fn run_tunnel_session(
     if cfg.max_pacing_rate_bps > 0 {
         quic_config.set_max_pacing_rate(cfg.max_pacing_rate_bps);
     }
+    let packet_buffer_pool_size = cfg
+        .packet_buffer_pool_size
+        .clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
+    let tx_queue_len = cfg.tx_queue_len.max(1).min(packet_buffer_pool_size);
     tracing::info!(
-        "QUIC tuning: quiche=0.29 cc={} initial_cwnd_packets={} udp_payload={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
+        "QUIC tuning: quiche=0.29 cc={} initial_cwnd_packets={} udp_payload={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
         cfg.cc_algorithm.trim(),
         cfg.initial_cwnd_packets,
         udp_payload,
         DGRAM_QUEUE_LEN,
-        cfg.tx_queue_len,
+        tx_queue_len,
         cfg.tx_burst_packets,
+        packet_buffer_pool_size,
+        cfg.udp_batch_size.clamp(1, MAX_UDP_BATCH_SIZE),
         if cfg.disable_quic_pacing { "off" } else { "on" },
         cfg.relaxed_loss,
         cfg.send_capacity_factor,
@@ -287,6 +586,8 @@ async fn run_tunnel_session(
 
     let mut out = vec![0u8; MAX_DATAGRAM_SIZE.max(udp_payload)];
     let mut buf = vec![0u8; 65_535];
+    let mut udp_batch =
+        UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.udp_batch_size);
 
     let (write, send_info) = conn
         .send(&mut out)
@@ -294,7 +595,15 @@ async fn run_tunnel_session(
     let _ = send_info;
     socket.send(&out[..write]).await?;
 
-    complete_quic_handshake(&socket, endpoint, local_addr, &mut conn, &mut buf, &mut out).await?;
+    complete_quic_handshake(
+        &socket,
+        endpoint,
+        local_addr,
+        &mut conn,
+        &mut buf,
+        &mut udp_batch,
+    )
+    .await?;
 
     if !cfg.insecure {
         if let Some(peer_cert) = conn.peer_cert() {
@@ -329,8 +638,18 @@ async fn run_tunnel_session(
     let flow_id = stream_id / 4;
     tracing::debug!("CONNECT request sent on stream {stream_id}, H3 DATAGRAM flow_id={flow_id}");
 
-    flush_quic(&socket, &mut conn, &mut out).await?;
-    wait_connect_response(&socket, endpoint, local_addr, &mut conn, &mut h3_conn, stream_id, &mut buf, &mut out).await?;
+    udp_batch.flush_quic(&socket, &mut conn).await?;
+    wait_connect_response(
+        &socket,
+        endpoint,
+        local_addr,
+        &mut conn,
+        &mut h3_conn,
+        stream_id,
+        &mut buf,
+        &mut udp_batch,
+    )
+    .await?;
 
     tracing::info!("Connected to MASQUE server");
     if let Some(path) = &cfg.on_connect {
@@ -345,8 +664,20 @@ async fn run_tunnel_session(
     let flow_prefix = build_flow_prefix(flow_id)?;
 
     if let Some(mut pkt) = pending_pkt.take() {
-        send_packet_datagram(&socket, endpoint, local_addr, &mut conn, &flow_prefix, &mut pkt, &stats, dev, &mut buf, &mut out).await?;
-        flush_quic(&socket, &mut conn, &mut out).await?;
+        send_packet_datagram(
+            &socket,
+            endpoint,
+            local_addr,
+            &mut conn,
+            &flow_prefix,
+            &mut pkt,
+            &stats,
+            dev,
+            &mut buf,
+            &mut udp_batch,
+        )
+        .await?;
+        udp_batch.flush_quic(&socket, &mut conn).await?;
     }
 
     let result = data_loop(
@@ -361,10 +692,10 @@ async fn run_tunnel_session(
         flow_id,
         &stats,
         cfg.keepalive_period,
-        cfg.tx_queue_len.max(1),
+        tx_queue_len,
         cfg.tx_burst_packets.max(1),
-        &mut buf,
-        &mut out,
+        packet_buffer_pool_size,
+        &mut udp_batch,
     )
     .await;
 
@@ -385,7 +716,7 @@ async fn complete_quic_handshake(
     local_addr: SocketAddr,
     conn: &mut quiche::Connection,
     buf: &mut [u8],
-    out: &mut [u8],
+    udp_batch: &mut UdpBatchIo,
 ) -> Result<()> {
     while !conn.is_established() {
         let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
@@ -397,7 +728,7 @@ async fn complete_quic_handshake(
             }
             () = tokio::time::sleep(timeout) => conn.on_timeout(),
         }
-        flush_quic(socket, conn, out).await?;
+        udp_batch.flush_quic(socket, conn).await?;
         if conn.is_closed() {
             bail!("connection closed during QUIC handshake");
         }
@@ -413,7 +744,7 @@ async fn wait_connect_response(
     h3_conn: &mut quiche::h3::Connection,
     stream_id: u64,
     buf: &mut [u8],
-    out: &mut [u8],
+    udp_batch: &mut UdpBatchIo,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -451,7 +782,7 @@ async fn wait_connect_response(
                 Err(e) => bail!("h3 poll error while waiting for CONNECT response: {e}"),
             }
         }
-        flush_quic(socket, conn, out).await?;
+        udp_batch.flush_quic(socket, conn).await?;
         if conn.is_closed() {
             bail!("connection closed before CONNECT response");
         }
@@ -472,27 +803,35 @@ async fn data_loop(
     keepalive_period: Duration,
     tx_queue_len: usize,
     tx_burst_packets: usize,
-    buf: &mut [u8],
-    out: &mut [u8],
+    packet_buffer_pool_size: usize,
+    udp_batch: &mut UdpBatchIo,
 ) -> Result<()> {
-    let (tx, mut tx_rx) = tokio::sync::mpsc::channel::<TxDatagram>(tx_queue_len);
+    let pool_size = packet_buffer_pool_size.clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
+    let queue_size = tx_queue_len.min(pool_size).max(1);
+    let (tx, mut tx_rx) = tokio::sync::mpsc::channel::<TxDatagram>(queue_size);
+    let (recycle_tx, mut free_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(pool_size);
     let reader_dev = dev.clone();
     let reader_stats = stats.clone();
     let reader_flow_prefix = flow_prefix.to_vec();
     let reader_buf_len = mtu + 128;
+    let packet_buffer_len = reader_flow_prefix.len() + reader_buf_len;
+    for _ in 0..pool_size {
+        recycle_tx
+            .try_send(vec![0u8; packet_buffer_len])
+            .map_err(|_| anyhow!("failed to initialize packet buffer pool"))?;
+    }
+    let reader_recycle_tx = recycle_tx.clone();
     let tun_reader = tokio::spawn(async move {
         let prefix_len = reader_flow_prefix.len();
         loop {
-            // Min-copy upload hot path:
-            //   1. allocate one initialized buffer for the complete MASQUE/H3 DATAGRAM,
-            //   2. write the tiny flow/context prefix once,
-            //   3. let tun-rs read the IP packet directly into the slice after it,
-            //   4. pass the encoded Vec to quiche with dgram_send_buf() (quiche 0.29 takes ownership).
-            // This leaves only the unavoidable kernel->userspace TUN copy, the tiny
-            // prefix write, QUIC encryption into the UDP output buffer, and the final
-            // kernel socket send copy. We intentionally avoid unsafe uninitialized
-            // buffers here because TunRsDevice::recv_packet() accepts &mut [u8].
-            let mut dgram = vec![0u8; prefix_len + reader_buf_len];
+            // tun-rs recommends reusable buffers for sustained packet I/O.
+            // FreeBSD does not expose tun-rs's Linux-only recv_multiple/offload
+            // path, so a bounded pool removes the per-packet allocation while
+            // retaining the portable native AsyncDevice API.
+            let Some(mut dgram) = free_rx.recv().await else {
+                break;
+            };
             dgram[..prefix_len].copy_from_slice(&reader_flow_prefix);
 
             match reader_dev.recv_packet(&mut dgram[prefix_len..]).await {
@@ -506,11 +845,15 @@ async fn data_loop(
                     if let Err(e) = packet::prepare_outgoing(&mut dgram[ip_start..ip_end]) {
                         reader_stats.dropped.fetch_add(1, Ordering::Relaxed);
                         tracing::trace!("dropping outgoing packet in TUN reader: {e}");
+                        let _ = reader_recycle_tx.try_send(dgram);
                         continue;
                     }
 
-                    dgram.truncate(ip_end);
-                    let tx_dgram = TxDatagram { bytes: dgram, ip_len: n };
+                    let tx_dgram = TxDatagram {
+                        bytes: dgram,
+                        wire_len: ip_end,
+                        ip_len: n,
+                    };
                     if tx.send(tx_dgram).await.is_err() {
                         break;
                     }
@@ -529,7 +872,7 @@ async fn data_loop(
         let mut last_network_activity = Instant::now();
 
         loop {
-            if drain_udp_nonblocking(socket, endpoint, local_addr, conn, buf) {
+            if udp_batch.drain_quic(socket, endpoint, local_addr, conn)? > 0 {
                 last_network_activity = Instant::now();
             }
             poll_h3(conn, h3_conn);
@@ -551,14 +894,20 @@ async fn data_loop(
                 }
             }
 
-            let progress = queue_tx_datagrams(conn, &mut tx_queue, stats, tx_burst_packets);
+            let progress = queue_tx_datagrams(
+                conn,
+                &mut tx_queue,
+                stats,
+                tx_burst_packets,
+                &recycle_tx,
+            );
             if progress.queued > 0 {
-                flush_quic(socket, conn, out).await?;
+                udp_batch.flush_quic(socket, conn).await?;
                 last_network_activity = Instant::now();
             } else if progress.backpressure {
                 // Quiche's DATAGRAM queue is full. Push already-queued QUIC packets
                 // out to UDP and then wait for ACKs/timers instead of burning CPU.
-                flush_quic(socket, conn, out).await?;
+                udp_batch.flush_quic(socket, conn).await?;
             }
 
             stats.tx_queue_len.store(tx_queue.len() as u64, Ordering::Relaxed);
@@ -596,13 +945,11 @@ async fn data_loop(
             };
             tokio::select! {
                 biased;
-                result = socket.recv(buf) => {
-                    let len = result?;
-                    let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                    if let Err(e) = conn.recv(&mut buf[..len], recv_info) {
-                        tracing::debug!("QUIC recv error: {e}");
+                result = socket.readable() => {
+                    result?;
+                    if udp_batch.drain_quic(socket, endpoint, local_addr, conn)? > 0 {
+                        last_network_activity = Instant::now();
                     }
-                    last_network_activity = Instant::now();
                 }
                 maybe_tx_dgram = tx_rx.recv(), if !tun_reader_closed && tx_queue.len() < tx_queue_len => {
                     match maybe_tx_dgram {
@@ -637,7 +984,7 @@ async fn data_loop(
                     }
 
                     if flush {
-                        flush_quic(socket, conn, out).await?;
+                        udp_batch.flush_quic(socket, conn).await?;
                     }
                 },
             }
@@ -682,7 +1029,12 @@ async fn build_tx_datagram(
         }
     }
 
-    Some(TxDatagram { bytes: dgram, ip_len })
+    let wire_len = dgram.len();
+    Some(TxDatagram {
+        bytes: dgram,
+        wire_len,
+        ip_len,
+    })
 }
 
 fn queue_tx_datagrams(
@@ -690,6 +1042,7 @@ fn queue_tx_datagrams(
     tx_queue: &mut VecDeque<TxDatagram>,
     stats: &Arc<Stats>,
     tx_burst_packets: usize,
+    recycle_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> TxProgress {
     let mut progress = TxProgress { queued: 0, backpressure: false };
     let budget = tx_burst_packets.max(1);
@@ -700,22 +1053,18 @@ fn queue_tx_datagrams(
         };
 
         if let Some(max_len) = conn.dgram_max_writable_len() {
-            if item.bytes.len() > max_len {
+            if item.wire_len > max_len {
                 stats.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     "dropping encoded DATAGRAM that exceeds peer/path writable len: {} > {}",
-                    item.bytes.len(),
+                    item.wire_len,
                     max_len
                 );
+                let _ = recycle_tx.try_send(item.bytes);
                 continue;
             }
         }
 
-        // quiche::Connection::dgram_send() copies the DATAGRAM payload into
-        // quiche's internal queue. We already own an encoded MASQUE/H3 DATAGRAM
-        // Vec at this point, so use dgram_send_buf() to hand ownership to
-        // quiche and avoid one memcpy on the upload hot path. This mirrors the
-        // zero-copy DATAGRAM API described by quiche.
         if conn.is_dgram_send_queue_full() {
             stats.tx_backpressure.fetch_add(1, Ordering::Relaxed);
             tx_queue.push_front(item);
@@ -724,25 +1073,23 @@ fn queue_tx_datagrams(
         }
 
         let ip_len = item.ip_len;
-        match conn.dgram_send_buf(item.bytes) {
+        match conn.dgram_send(&item.bytes[..item.wire_len]) {
             Ok(()) => {
                 stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                 stats.tx_bytes.fetch_add(ip_len as u64, Ordering::Relaxed);
+                let _ = recycle_tx.try_send(item.bytes);
                 progress.queued += 1;
             }
             Err(quiche::Error::Done) => {
-                // This should be rare because we checked is_dgram_send_queue_full()
-                // just above. dgram_send_buf() consumes the buffer, so we cannot
-                // safely retry the exact same owned Vec here. Count it separately
-                // as both backpressure and a drop so it is visible in logs.
                 stats.tx_backpressure.fetch_add(1, Ordering::Relaxed);
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
+                tx_queue.push_front(item);
                 progress.backpressure = true;
                 break;
             }
             Err(e) => {
                 stats.dropped.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("datagram send_buf error: {e}; dropping encoded DATAGRAM");
+                tracing::debug!("datagram send error: {e}; dropping encoded DATAGRAM");
+                let _ = recycle_tx.try_send(item.bytes);
             }
         }
     }
@@ -802,7 +1149,7 @@ async fn send_packet_datagram(
     stats: &Arc<Stats>,
     dev: &Arc<TunRsDevice>,
     buf: &mut [u8],
-    out: &mut [u8],
+    udp_batch: &mut UdpBatchIo,
 ) -> Result<()> {
     match packet::prepare_outgoing(pkt) {
         Ok(_) => {
@@ -850,8 +1197,8 @@ async fn send_packet_datagram(
                     }
                 }
 
-                flush_quic(socket, conn, out).await?;
-                drain_udp_nonblocking(socket, endpoint, local_addr, conn, buf);
+                udp_batch.flush_quic(socket, conn).await?;
+                udp_batch.drain_quic(socket, endpoint, local_addr, conn)?;
 
                 if conn.is_closed() {
                     bail!("QUIC connection closed while waiting for DATAGRAM queue space");
@@ -892,42 +1239,6 @@ async fn send_packet_datagram(
             Ok(())
         }
     }
-}
-
-fn drain_udp_nonblocking(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    buf: &mut [u8],
-) -> bool {
-    let mut received = false;
-    while let Ok(len) = socket.try_recv(buf) {
-        received = true;
-        let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-        if let Err(e) = conn.recv(&mut buf[..len], recv_info) {
-            tracing::debug!("QUIC recv error while draining UDP: {e}");
-        }
-    }
-    received
-}
-
-async fn flush_quic(
-    socket: &tokio::net::UdpSocket,
-    conn: &mut quiche::Connection,
-    out: &mut [u8],
-) -> Result<()> {
-    loop {
-        match conn.send(out) {
-            Ok((write, send_info)) => {
-                let _ = send_info;
-                socket.send(&out[..write]).await?;
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => bail!("quic send error: {e}"),
-        }
-    }
-    Ok(())
 }
 
 fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
@@ -1017,6 +1328,16 @@ fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_batch_size_is_bounded() {
+        assert_eq!(UdpBatchIo::new(1250, 0).batch_size, 1);
+        assert_eq!(UdpBatchIo::new(1250, 32).batch_size, 32);
+        assert_eq!(
+            UdpBatchIo::new(1250, MAX_UDP_BATCH_SIZE + 1).batch_size,
+            MAX_UDP_BATCH_SIZE
+        );
+    }
 
     #[test]
     fn keepalive_can_be_disabled() {

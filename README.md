@@ -74,6 +74,8 @@ The application configures interface addresses and MTU, but does not manage the 
 | `--initial-packet-size` | `1250` | Leaves room for QUIC/MASQUE overhead |
 | `--tx-queue-len` | `8192` | Decouples the TUN reader from QUIC pacing |
 | `--tx-burst-packets` | `256` | Stable upload-performance compromise |
+| `--packet-buffer-pool-size` | `1024` | Reusable upload buffers; clamped to `1..16384` and bounds the effective TX queue |
+| `--udp-batch-size` | `32` | FreeBSD `sendmmsg`/`recvmmsg` batch size; clamped to `1..64` |
 | `--keepalive-period` | `25s` | Sends an RFC 9000 QUIC PING after network inactivity; use `0s` to disable |
 
 Optional tuning example:
@@ -103,7 +105,18 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.
-- The MASQUE DATAGRAM queue uses `Connection::dgram_send_buf()` to avoid an additional slice copy.
+- The FreeBSD hot path batches already-produced QUIC UDP datagrams with
+  `sendmmsg` and drains them with `recvmmsg`, reducing kernel/userspace
+  transitions without changing MASQUE framing. A packet is batched only after
+  its quiche pacing deadline, so the syscall optimization does not bypass QUIC
+  congestion-control timing.
+- The TUN reader uses a bounded reusable buffer pool. Because quiche owns its
+  internal DATAGRAM queue, the pooled buffer is copied once with
+  `Connection::dgram_send()` and immediately returned to the pool. This trades
+  one small bounded copy for eliminating a heap allocation per IP packet.
+- `tun-rs` remains on its supported native FreeBSD async path. Its
+  `recv_multiple`/`send_multiple`, GRO and offload APIs are Linux-only and are
+  intentionally not emulated here.
 - The FreeBSD raw TUN direction is documented but is not enabled by default; `tun-rs` remains the production backend.
 - See [FreeBSD raw TUN notes](docs/FREEBSD_RAW_TUN_NOTES.md) for the current design considerations.
 
