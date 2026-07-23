@@ -1,6 +1,6 @@
 use crate::api::hooks::run_hook;
 use crate::api::{icmp, packet};
-use crate::config::{AppConfig, EndpointAddr};
+use crate::config::{AppConfig, MasqueEndpoint};
 use crate::native_tun::TunRsDevice;
 use anyhow::{anyhow, bail, Context, Result};
 use octets::{Octets, OctetsMut};
@@ -31,10 +31,9 @@ const MAX_UDP_BATCH_SIZE: usize = 64;
 #[derive(Clone)]
 pub struct MasqueConfig {
     pub private_key: SecretKey,
-    pub endpoint_pub_key_spki_der: Vec<u8>,
     pub sni: String,
     pub insecure: bool,
-    pub endpoint: EndpointAddr,
+    pub endpoints: Vec<MasqueEndpoint>,
     pub keepalive_period: Duration,
     pub initial_packet_size: u16,
     pub cc_algorithm: String,
@@ -386,10 +385,6 @@ fn recvmmsg_nonblocking(
     Ok(result as usize)
 }
 
-fn endpoint_socket(endpoint: &EndpointAddr) -> SocketAddr {
-    endpoint.0
-}
-
 fn create_connected_udp_socket(endpoint: SocketAddr, socket_buffer_size: usize) -> Result<tokio::net::UdpSocket> {
     let domain = if endpoint.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let bind_addr: SocketAddr = if endpoint.is_ipv4() {
@@ -430,6 +425,7 @@ pub async fn maintain_native_tun(
     mtu: usize,
 ) -> Result<()> {
     let mut pending_pkt: Option<Vec<u8>> = None;
+    let mut endpoint_index = 0usize;
 
     loop {
         if !cfg.always_reconnect && pending_pkt.is_none() {
@@ -444,16 +440,34 @@ pub async fn maintain_native_tun(
             tracing::info!("Detected outbound activity ({n} bytes). Connecting...");
         }
 
-        tracing::info!("Establishing MASQUE connection to {}", cfg.endpoint);
-        match run_tunnel_session(&cfg, &dev, mtu, &mut pending_pkt).await {
+        let endpoint = cfg
+            .endpoints
+            .get(endpoint_index)
+            .ok_or_else(|| anyhow!("MASQUE endpoint list is empty"))?;
+        tracing::info!(
+            "Establishing MASQUE connection to {} ({}/{}){}",
+            endpoint.addr,
+            endpoint_index + 1,
+            cfg.endpoints.len(),
+            if endpoint.host.is_empty() {
+                String::new()
+            } else {
+                format!(" for {}", endpoint.host)
+            }
+        );
+        match run_tunnel_session(&cfg, endpoint, &dev, mtu, &mut pending_pkt).await {
             Ok(()) => tracing::warn!("MASQUE session ended. Reconnecting..."),
             Err(err) => tracing::warn!("MASQUE session failed: {err:#}. Reconnecting..."),
         }
+        endpoint_index = (endpoint_index + 1) % cfg.endpoints.len();
         tokio::time::sleep(cfg.reconnect_delay).await;
     }
 }
 
-fn prepare_tls_material(cfg: &MasqueConfig) -> Result<TlsMaterial> {
+fn prepare_tls_material(
+    cfg: &MasqueConfig,
+    endpoint: &MasqueEndpoint,
+) -> Result<TlsMaterial> {
     let key_pem = cfg
         .private_key
         .to_pkcs8_pem(LineEnding::LF)
@@ -483,7 +497,7 @@ fn prepare_tls_material(cfg: &MasqueConfig) -> Result<TlsMaterial> {
     Ok(TlsMaterial {
         cert_pem_file,
         key_pem_file,
-        endpoint_pub_key_spki_der: cfg.endpoint_pub_key_spki_der.clone(),
+        endpoint_pub_key_spki_der: endpoint.endpoint_pub_key_spki_der.clone(),
     })
 }
 
@@ -497,12 +511,13 @@ fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {
 
 async fn run_tunnel_session(
     cfg: &MasqueConfig,
+    selected_endpoint: &MasqueEndpoint,
     dev: &Arc<TunRsDevice>,
     mtu: usize,
     pending_pkt: &mut Option<Vec<u8>>,
 ) -> Result<()> {
-    let endpoint = endpoint_socket(&cfg.endpoint);
-    let tls_material = prepare_tls_material(cfg)?;
+    let endpoint = selected_endpoint.addr.0;
+    let tls_material = prepare_tls_material(cfg, selected_endpoint)?;
 
     let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| anyhow!("quiche config: {e}"))?;
@@ -573,263 +588,7 @@ async fn run_tunnel_session(
     quic_config.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
     let socket = create_connected_udp_socket(endpoint, cfg.udp_socket_buffer)?;
-    let local_addr = socket.local_addr()?;
-
-    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    ring::rand::SystemRandom::new()
-        .fill(&mut scid)
-        .map_err(|_| anyhow!("RNG failure"))?;
-    let scid = quiche::ConnectionId::from_ref(&scid);
-
-    let mut conn = quiche::connect(Some(&cfg.sni), &scid, local_addr, endpoint, &mut quic_config)
-        .map_err(|e| anyhow!("quiche connect: {e}"))?;
-
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE.max(udp_payload)];
-    let mut buf = vec![0u8; 65_535];
-    let mut udp_batch =
-        UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.udp_batch_size);
-
-    let (write, send_info) = conn
-        .send(&mut out)
-        .map_err(|e| anyhow!("initial send: {e}"))?;
-    let _ = send_info;
-    socket.send(&out[..write]).await?;
-
-    complete_quic_handshake(
-        &socket,
-        endpoint,
-        local_addr,
-        &mut conn,
-        &mut buf,
-        &mut udp_batch,
-    )
-    .await?;
-
-    if !cfg.insecure {
-        if let Some(peer_cert) = conn.peer_cert() {
-            if !verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
-                bail!("remote endpoint public key does not match config.json endpoint_pub_key");
-            }
-            tracing::debug!("Endpoint key pinning verified");
-        } else {
-            bail!("no peer certificate received; cannot verify endpoint public key");
-        }
-    } else {
-        tracing::warn!("--insecure is set; skipping endpoint public key pinning");
-    }
-
-    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow!("h3 config: {e}"))?;
-    h3_config.enable_extended_connect(true);
-    let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-        .map_err(|e| anyhow!("h3 connection: {e}"))?;
-
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"CONNECT"),
-        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-        quiche::h3::Header::new(b":path", b"/"),
-        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        quiche::h3::Header::new(b"user-agent", b""),
-    ];
-    let stream_id = h3_conn
-        .send_request(&mut conn, &req, false)
-        .map_err(|e| anyhow!("send CONNECT request: {e}"))?;
-    let flow_id = stream_id / 4;
-    tracing::debug!("CONNECT request sent on stream {stream_id}, H3 DATAGRAM flow_id={flow_id}");
-
-    udp_batch.flush_quic(&socket, &mut conn).await?;
-    wait_connect_response(
-        &socket,
-        endpoint,
-        local_addr,
-        &mut conn,
-        &mut h3_conn,
-        stream_id,
-        &mut buf,
-        &mut udp_batch,
-    )
-    .await?;
-
-    tracing::info!("Connected to MASQUE server");
-    if let Some(path) = &cfg.on_connect {
-        let mut env = cfg.hook_env.clone();
-        env.insert("USQUE_EVENT".to_string(), "connect".to_string());
-        env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
-        run_hook(path, &env);
-    }
-
-    let stats = Stats::new();
-    let stats_handle = spawn_stats_task(stats.clone(), Instant::now());
-    let flow_prefix = build_flow_prefix(flow_id)?;
-
-    if let Some(mut pkt) = pending_pkt.take() {
-        send_packet_datagram(
-            &socket,
-            endpoint,
-            local_addr,
-            &mut conn,
-            &flow_prefix,
-            &mut pkt,
-            &stats,
-            dev,
-            &mut buf,
-            &mut udp_batch,
-        )
-        .await?;
-        udp_batch.flush_quic(&socket, &mut conn).await?;
-    }
-
-    let result = data_loop(
-        &socket,
-        endpoint,
-        local_addr,
-        &mut conn,
-        &mut h3_conn,
-        dev,
-        mtu,
-        &flow_prefix,
-        flow_id,
-        &stats,
-        cfg.keepalive_period,
-        tx_queue_len,
-        cfg.tx_burst_packets.max(1),
-        packet_buffer_pool_size,
-        &mut udp_batch,
-    )
-    .await;
-
-    stats_handle.abort();
-    if let Some(path) = &cfg.on_disconnect {
-        let mut env = cfg.hook_env.clone();
-        env.insert("USQUE_EVENT".to_string(), "disconnect".to_string());
-        env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
-        run_hook(path, &env);
-    }
-
-    result
-}
-
-async fn complete_quic_handshake(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    buf: &mut [u8],
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    while !conn.is_established() {
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-        tokio::select! {
-            result = socket.recv(buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                conn.recv(&mut buf[..len], recv_info).ok();
-            }
-            () = tokio::time::sleep(timeout) => conn.on_timeout(),
-        }
-        udp_batch.flush_quic(socket, conn).await?;
-        if conn.is_closed() {
-            bail!("connection closed during QUIC handshake");
-        }
-    }
-    Ok(())
-}
-
-async fn wait_connect_response(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut quiche::h3::Connection,
-    stream_id: u64,
-    buf: &mut [u8],
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for CONNECT response");
-        }
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-        tokio::select! {
-            result = socket.recv(buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                conn.recv(&mut buf[..len], recv_info).ok();
-            }
-            () = tokio::time::sleep(timeout) => conn.on_timeout(),
-        }
-
-        loop {
-            match h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
-                    for h in &list {
-                        if h.name() == b":status" {
-                            let status = std::str::from_utf8(h.value()).unwrap_or("?");
-                            if status.starts_with('2') {
-                                return Ok(());
-                            }
-                            if status == "403" {
-                                bail!("CONNECT rejected with 403; login failed or Access enrollment/certificate is not accepted");
-                            }
-                            bail!("CONNECT rejected with status {status}");
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => bail!("h3 poll error while waiting for CONNECT response: {e}"),
-            }
-        }
-        udp_batch.flush_quic(socket, conn).await?;
-        if conn.is_closed() {
-            bail!("connection closed before CONNECT response");
-        }
-    }
-}
-
-async fn data_loop(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut quiche::h3::Connection,
-    dev: &Arc<TunRsDevice>,
-    mtu: usize,
-    flow_prefix: &[u8],
-    flow_id: u64,
-    stats: &Arc<Stats>,
-    keepalive_period: Duration,
-    tx_queue_len: usize,
-    tx_burst_packets: usize,
-    packet_buffer_pool_size: usize,
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    let pool_size = packet_buffer_pool_size.clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
-    let queue_size = tx_queue_len.min(pool_size).max(1);
-    let (tx, mut tx_rx) = tokio::sync::mpsc::channel::<TxDatagram>(queue_size);
-    let (recycle_tx, mut free_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(pool_size);
-    let reader_dev = dev.clone();
-    let reader_stats = stats.clone();
-    let reader_flow_prefix = flow_prefix.to_vec();
-    let reader_buf_len = mtu + 128;
-    let packet_buffer_len = reader_flow_prefix.len() + reader_buf_len;
-    for _ in 0..pool_size {
-        recycle_tx
-            .try_send(vec![0u8; packet_buffer_len])
-            .map_err(|_| anyhow!("failed to initialize packet buffer pool"))?;
-    }
-    let reader_recycle_tx = recycle_tx.clone();
-    let tun_reader = tokio::spawn(async move {
-        let prefix_len = reader_flow_prefix.len();
-        loop {
-            // tun-rs recommends reusable buffers for sustained packet I/O.
-            // FreeBSD does not expose tun-rs's Linux-only recv_multiple/offload
-            // path, so a bounded pool removes the per-packet allocation while
-            // retaining the portable native AsyncDevice API.
-            let Some(mut dgram) = free_rx.recv().await else {
+    let local_addr = socket.local_addr()?…2220 tokens truncated… free_rx.recv().await else {
                 break;
             };
             dgram[..prefix_len].copy_from_slice(&reader_flow_prefix);
