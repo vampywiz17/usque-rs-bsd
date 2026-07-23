@@ -59,9 +59,6 @@ impl AppConfig {
         SecretKey::from_sec1_der(&der).context("failed to parse P-256 SEC1 private key")
     }
 
-    pub fn get_ec_endpoint_public_key_der(&self) -> Result<Vec<u8>> {
-        decode_endpoint_public_key(&self.endpoint_pub_key)
-    }
 }
 
 #[derive(Debug, Clone)]
