@@ -1361,9 +1361,12 @@ mod tests {
 
     fn encode_varint(val: u64) -> Vec<u8> {
         let mut tmp = [0u8; 8];
-        let mut b = OctetsMut::with_slice(&mut tmp);
-        b.put_varint(val).unwrap();
-        tmp[..b.off()].to_vec()
+        let len = {
+            let mut b = OctetsMut::with_slice(&mut tmp);
+            b.put_varint(val).unwrap();
+            b.off()
+        };
+        tmp[..len].to_vec()
     }
 
     #[test]
