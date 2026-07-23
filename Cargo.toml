@@ -1,0 +1,43 @@
+[package]
+name = "usque-nativetun"
+version = "0.4.3"
+edition = "2021"
+license = "MIT"
+description = "Native-TUN-only Rust port of usque using tun-rs and quiche MASQUE/CONNECT-IP support; FreeBSD tuned release"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+der = { version = "0.7", features = ["pem", "std"] }
+hex = "0.4"
+octets = "0.3"
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+pem = "3"
+pkcs8 = { version = "0.10", features = ["pem", "std"] }
+portable-atomic = { version = "1", features = ["fallback"] }
+quiche = { version = "0.29.2", features = ["gcongestion"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
+tempfile = "3"
+thiserror = "2"
+time = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tun-rs = { version = "2", features = ["async"] }
+x509-parser = "0.16"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
