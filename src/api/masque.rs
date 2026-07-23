@@ -269,11 +269,21 @@ impl UdpBatchIo {
     ) -> std::io::Result<usize> {
         #[cfg(target_os = "freebsd")]
         {
-            return recvmmsg_nonblocking(
-                socket.as_raw_fd(),
-                &mut self.rx_buffers,
-                &mut self.tx_lens,
-            );
+            // recvmmsg() operates on the raw descriptor, so it must run through
+            // Tokio's readiness guard. EAGAIN must reach try_io() so Tokio can
+            // clear a stale readable notification. Converting it to Ok(0)
+            // earlier leaves the socket readable forever and causes a busy loop.
+            return match socket.try_io(tokio::io::Interest::READABLE, || {
+                recvmmsg_nonblocking(
+                    socket.as_raw_fd(),
+                    &mut self.rx_buffers,
+                    &mut self.tx_lens,
+                )
+            }) {
+                Ok(count) => Ok(count),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+                Err(err) => Err(err),
+            };
         }
 
         #[cfg(not(target_os = "freebsd"))]
@@ -366,11 +376,9 @@ fn recvmmsg_nonblocking(
         )
     };
     if result < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(0);
-        }
-        return Err(err);
+        // Preserve EAGAIN so UdpSocket::try_io() can clear Tokio's readable
+        // readiness state. The caller turns it into an empty batch afterwards.
+        return Err(std::io::Error::last_os_error());
     }
 
     for index in 0..result as usize {
@@ -571,298 +579,7 @@ async fn run_tunnel_session(
     tracing::info!(
         "QUIC tuning: quiche=0.29 cc={} initial_cwnd_packets={} udp_payload={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
         cfg.cc_algorithm.trim(),
-        cfg.initial_cwnd_packets,
-        udp_payload,
-        DGRAM_QUEUE_LEN,
-        tx_queue_len,
-        cfg.tx_burst_packets,
-        packet_buffer_pool_size,
-        cfg.udp_batch_size.clamp(1, MAX_UDP_BATCH_SIZE),
-        if cfg.disable_quic_pacing { "off" } else { "on" },
-        cfg.relaxed_loss,
-        cfg.send_capacity_factor,
-        cfg.max_pacing_rate_bps,
-        cfg.udp_socket_buffer,
-    );
-    quic_config.set_disable_active_migration(true);
-    quic_config.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
-
-    let socket = create_connected_udp_socket(endpoint, cfg.udp_socket_buffer)?;
-    let local_addr = socket.local_addr()?;
-
-    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    ring::rand::SystemRandom::new()
-        .fill(&mut scid)
-        .map_err(|_| anyhow!("RNG failure"))?;
-    let scid = quiche::ConnectionId::from_ref(&scid);
-
-    let mut conn = quiche::connect(Some(&cfg.sni), &scid, local_addr, endpoint, &mut quic_config)
-        .map_err(|e| anyhow!("quiche connect: {e}"))?;
-
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE.max(udp_payload)];
-    let mut buf = vec![0u8; 65_535];
-    let mut udp_batch =
-        UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.udp_batch_size);
-
-    let (write, send_info) = conn
-        .send(&mut out)
-        .map_err(|e| anyhow!("initial send: {e}"))?;
-    let _ = send_info;
-    socket.send(&out[..write]).await?;
-
-    complete_quic_handshake(
-        &socket,
-        endpoint,
-        local_addr,
-        &mut conn,
-        &mut buf,
-        &mut udp_batch,
-    )
-    .await?;
-
-    if !cfg.insecure {
-        if let Some(peer_cert) = conn.peer_cert() {
-            if !verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
-                bail!("remote endpoint public key does not match config.json endpoint_pub_key");
-            }
-            tracing::debug!("Endpoint key pinning verified");
-        } else {
-            bail!("no peer certificate received; cannot verify endpoint public key");
-        }
-    } else {
-        tracing::warn!("--insecure is set; skipping endpoint public key pinning");
-    }
-
-    let mut h3_config = quiche::h3::Config::new().map_err(|e| anyhow!("h3 config: {e}"))?;
-    h3_config.enable_extended_connect(true);
-    let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-        .map_err(|e| anyhow!("h3 connection: {e}"))?;
-
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"CONNECT"),
-        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-        quiche::h3::Header::new(b":path", b"/"),
-        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        quiche::h3::Header::new(b"user-agent", b""),
-    ];
-    let stream_id = h3_conn
-        .send_request(&mut conn, &req, false)
-        .map_err(|e| anyhow!("send CONNECT request: {e}"))?;
-    let flow_id = stream_id / 4;
-    tracing::debug!("CONNECT request sent on stream {stream_id}, H3 DATAGRAM flow_id={flow_id}");
-
-    udp_batch.flush_quic(&socket, &mut conn).await?;
-    wait_connect_response(
-        &socket,
-        endpoint,
-        local_addr,
-        &mut conn,
-        &mut h3_conn,
-        stream_id,
-        &mut buf,
-        &mut udp_batch,
-    )
-    .await?;
-
-    tracing::info!("Connected to MASQUE server");
-    if let Some(path) = &cfg.on_connect {
-        let mut env = cfg.hook_env.clone();
-        env.insert("USQUE_EVENT".to_string(), "connect".to_string());
-        env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
-        run_hook(path, &env);
-    }
-
-    let stats = Stats::new();
-    let stats_handle = spawn_stats_task(stats.clone(), Instant::now());
-    let flow_prefix = build_flow_prefix(flow_id)?;
-
-    if let Some(mut pkt) = pending_pkt.take() {
-        send_packet_datagram(
-            &socket,
-            endpoint,
-            local_addr,
-            &mut conn,
-            &flow_prefix,
-            &mut pkt,
-            &stats,
-            dev,
-            &mut buf,
-            &mut udp_batch,
-        )
-        .await?;
-        udp_batch.flush_quic(&socket, &mut conn).await?;
-    }
-
-    let result = data_loop(
-        &socket,
-        endpoint,
-        local_addr,
-        &mut conn,
-        &mut h3_conn,
-        dev,
-        mtu,
-        &flow_prefix,
-        flow_id,
-        &stats,
-        cfg.keepalive_period,
-        tx_queue_len,
-        cfg.tx_burst_packets.max(1),
-        packet_buffer_pool_size,
-        &mut udp_batch,
-    )
-    .await;
-
-    stats_handle.abort();
-    if let Some(path) = &cfg.on_disconnect {
-        let mut env = cfg.hook_env.clone();
-        env.insert("USQUE_EVENT".to_string(), "disconnect".to_string());
-        env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
-        run_hook(path, &env);
-    }
-
-    result
-}
-
-async fn complete_quic_handshake(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    buf: &mut [u8],
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    while !conn.is_established() {
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-        tokio::select! {
-            result = socket.recv(buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                conn.recv(&mut buf[..len], recv_info).ok();
-            }
-            () = tokio::time::sleep(timeout) => conn.on_timeout(),
-        }
-        udp_batch.flush_quic(socket, conn).await?;
-        if conn.is_closed() {
-            bail!("connection closed during QUIC handshake");
-        }
-    }
-    Ok(())
-}
-
-async fn wait_connect_response(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut quiche::h3::Connection,
-    stream_id: u64,
-    buf: &mut [u8],
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for CONNECT response");
-        }
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-        tokio::select! {
-            result = socket.recv(buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                conn.recv(&mut buf[..len], recv_info).ok();
-            }
-            () = tokio::time::sleep(timeout) => conn.on_timeout(),
-        }
-
-        loop {
-            match h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
-                    for h in &list {
-                        if h.name() == b":status" {
-                            let status = std::str::from_utf8(h.value()).unwrap_or("?");
-                            if status.starts_with('2') {
-                                return Ok(());
-                            }
-                            if status == "403" {
-                                bail!("CONNECT rejected with 403; login failed or Access enrollment/certificate is not accepted");
-                            }
-                            bail!("CONNECT rejected with status {status}");
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => bail!("h3 poll error while waiting for CONNECT response: {e}"),
-            }
-        }
-        udp_batch.flush_quic(socket, conn).await?;
-        if conn.is_closed() {
-            bail!("connection closed before CONNECT response");
-        }
-    }
-}
-
-async fn data_loop(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut quiche::h3::Connection,
-    dev: &Arc<TunRsDevice>,
-    mtu: usize,
-    flow_prefix: &[u8],
-    flow_id: u64,
-    stats: &Arc<Stats>,
-    keepalive_period: Duration,
-    tx_queue_len: usize,
-    tx_burst_packets: usize,
-    packet_buffer_pool_size: usize,
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    let pool_size = packet_buffer_pool_size.clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
-    let queue_size = tx_queue_len.min(pool_size).max(1);
-    let (tx, mut tx_rx) = tokio::sync::mpsc::channel::<TxDatagram>(queue_size);
-    let (recycle_tx, mut free_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(pool_size);
-    let reader_dev = dev.clone();
-    let reader_stats = stats.clone();
-    let reader_flow_prefix = flow_prefix.to_vec();
-    let reader_buf_len = mtu + 128;
-    let packet_buffer_len = reader_flow_prefix.len() + reader_buf_len;
-    for _ in 0..pool_size {
-        recycle_tx
-            .try_send(vec![0u8; packet_buffer_len])
-            .map_err(|_| anyhow!("failed to initialize packet buffer pool"))?;
-    }
-    let reader_recycle_tx = recycle_tx.clone();
-    let tun_reader = tokio::spawn(async move {
-        let prefix_len = reader_flow_prefix.len();
-        loop {
-            // tun-rs recommends reusable buffers for sustained packet I/O.
-            // FreeBSD does not expose tun-rs's Linux-only recv_multiple/offload
-            // path, so a bounded pool removes the per-packet allocation while
-            // retaining the portable native AsyncDevice API.
-            let Some(mut dgram) = free_rx.recv().await else {
-                break;
-            };
-            dgram[..prefix_len].copy_from_slice(&reader_flow_prefix);
-
-            match reader_dev.recv_packet(&mut dgram[prefix_len..]).await {
-                Ok(0) => {
-                    tracing::debug!("TUN reader received EOF");
-                    break;
-                }
-                Ok(n) => {
-                    let ip_start = prefix_len;
-                    let ip_end = prefix_len + n;
-                    if let Err(e) = packet::prepare_outgoing(&mut dgram[ip_start..ip_end]) {
-                        reader_stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        tracing::trace!("dropping outgoing packet in TUN reader: {e}");
-                        let _ = reader_recycle_tx.try_send(dgram);
-                        continue;
-                    }
+        cfg.initial…2589 tokens truncated…                }
 
                     let tx_dgram = TxDatagram {
                         bytes: dgram,
@@ -959,7 +676,6 @@ async fn data_loop(
                 (None, None) => (Duration::from_secs(60 * 60), false),
             };
             tokio::select! {
-                biased;
                 result = socket.readable() => {
                     result?;
                     if udp_batch.drain_quic(socket, endpoint, local_addr, conn)? > 0 {
@@ -1354,6 +1070,29 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "freebsd")]
+    #[tokio::test]
+    async fn recvmmsg_clears_tokio_readiness_after_eagain() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(b"x", receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        receiver.readable().await.unwrap();
+        let mut batch = UdpBatchIo::new(1500, 4);
+        assert_eq!(batch.try_recv_batch(&receiver).unwrap(), 1);
+        assert_eq!(batch.try_recv_batch(&receiver).unwrap(), 0);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.readable())
+                .await
+                .is_err(),
+            "readable readiness stayed set after recvmmsg returned EAGAIN"
+        );
+    }
+
     #[test]
     fn keepalive_can_be_disabled() {
         assert_eq!(
@@ -1392,3 +1131,4 @@ mod tests {
         assert_eq!(parse_datagram(&d, 4), Some(b"payload".as_ref()));
     }
 }
+
