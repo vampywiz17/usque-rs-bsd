@@ -205,6 +205,41 @@ cargo check
 cargo build --release
 ```
 
+## Disclaimer
+
+Please do not use this project for abuse. Abusive use harms Cloudflare, risks
+sanctions against this project, and may make the service less accessible to
+everyone. You are solely responsible for how you use this software and for
+complying with Cloudflare's terms and all applicable laws.
+
+This project implements properties of Cloudflare's clients and wire contracts
+only where they are required for protocol compatibility, interoperability and
+connection stability. It is not intended to be indistinguishable from an
+official client and does not attempt to conceal its identity. In particular,
+device-state and monitoring data sent to Cloudflare are truthful: the client
+identifies the platform as FreeBSD, uses this project's own version identity,
+and derives connection status, tunnel mode, tunnel type, colocation, latency
+and loss data from the real system and MASQUE session state. It does not
+fabricate telemetry or report itself as an official Cloudflare client.
+Cloudflare can distinguish and restrict this implementation at any time.
+
+This software is provided as-is, without warranties or guarantees. Its authors
+are not responsible for account sanctions, service interruption, data loss, or
+damage to systems or networks resulting from its use. Although the project is
+developed with security in mind, it is an independent hobby and research
+project, not a professionally audited security product. Use it at your own
+risk.
+
+Responsible security reports are welcome. Please open an issue containing only
+your contact details and a brief, non-sensitive summary so that the full
+findings can be coordinated in private. Do not publish exploit details before
+there has been reasonable time to investigate and fix the issue.
+
+**This project is not affiliated with, endorsed by, or reviewed by Cloudflare,
+Inc. It is an independent research project. Cloudflare WARP, WARP+, 1.1.1.1,
+Cloudflare Access, Cloudflare Gateway and Cloudflare One are
+[Cloudflare trademarks and wordmarks](https://www.cloudflare.com/trademark/).**
+
 ## Acknowledgements
 
 This project is derived from the upstream [usque-rs](https://github.com/Diniboy1123/usque-rs) project and builds on Cloudflare's open-source [quiche](https://github.com/cloudflare/quiche) library.
