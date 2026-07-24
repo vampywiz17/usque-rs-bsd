@@ -1,5 +1,7 @@
 mod connect_ip;
+mod stats;
 mod supervisor;
+mod timing;
 mod udp;
 pub use supervisor::maintain_native_tun;
 
@@ -12,16 +14,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use connect_ip::{build_flow_prefix, parse_datagram};
 use p256::pkcs8::{EncodePrivateKey, LineEnding};
 use p256::SecretKey;
-use portable_atomic::{AtomicU64, Ordering};
+use portable_atomic::Ordering;
 use quiche::h3::NameValue;
 use rcgen::{CertificateParams, KeyPair};
 use ring::rand::SecureRandom;
+use stats::{spawn_stats_task, Stats};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
+use timing::{discovered_tun_mtu, keepalive_remaining, pmtud_remaining};
 use udp::{create_connected_udp_socket, UdpBatchIo, MAX_DATAGRAM_SIZE, MAX_UDP_BATCH_SIZE};
 
 const MIN_MTU: u16 = 1280;
@@ -85,34 +89,6 @@ struct TlsMaterial {
     cert_pem_file: NamedTempFile,
     key_pem_file: NamedTempFile,
     endpoint_pub_key_spki_der: Vec<u8>,
-}
-
-struct Stats {
-    tx_packets: AtomicU64,
-    rx_packets: AtomicU64,
-    tx_bytes: AtomicU64,
-    rx_bytes: AtomicU64,
-    dropped: AtomicU64,
-    quic_lost: AtomicU64,
-    quic_retrans: AtomicU64,
-    tx_queue_len: AtomicU64,
-    tx_backpressure: AtomicU64,
-}
-
-impl Stats {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            tx_packets: AtomicU64::new(0),
-            rx_packets: AtomicU64::new(0),
-            tx_bytes: AtomicU64::new(0),
-            rx_bytes: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            quic_lost: AtomicU64::new(0),
-            quic_retrans: AtomicU64::new(0),
-            tx_queue_len: AtomicU64::new(0),
-            tx_backpressure: AtomicU64::new(0),
-        })
-    }
 }
 
 struct TxDatagram {
@@ -1003,90 +979,6 @@ async fn send_packet_datagram(
     }
 }
 
-fn keepalive_remaining(period: Duration, since_last_probe: Duration) -> Option<Duration> {
-    if period.is_zero() {
-        None
-    } else {
-        Some(period.saturating_sub(since_last_probe))
-    }
-}
-
-fn pmtud_remaining(
-    enabled: bool,
-    period: Duration,
-    since_last_probe: Duration,
-) -> Option<Duration> {
-    if !enabled || period.is_zero() {
-        None
-    } else {
-        Some(period.saturating_sub(since_last_probe))
-    }
-}
-
-fn discovered_tun_mtu(
-    conn: &quiche::Connection,
-    masque_context_len: usize,
-    maximum: u16,
-) -> Option<u16> {
-    conn.pmtu()?;
-    let writable = conn.dgram_max_writable_len()?;
-    let inner = writable.checked_sub(masque_context_len)?;
-    Some(inner.min(usize::from(maximum)).min(usize::from(u16::MAX)) as u16)
-}
-
-fn spawn_stats_task(stats: Arc<Stats>, start: Instant) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            tracing::info!(
-                "connected={} tx={} ({}) rx={} ({}) drop={} txq={} bp={} lost={} retrans={}",
-                format_duration(start.elapsed()),
-                stats.tx_packets.load(Ordering::Relaxed),
-                format_bytes(stats.tx_bytes.load(Ordering::Relaxed)),
-                stats.rx_packets.load(Ordering::Relaxed),
-                format_bytes(stats.rx_bytes.load(Ordering::Relaxed)),
-                stats.dropped.load(Ordering::Relaxed),
-                stats.tx_queue_len.load(Ordering::Relaxed),
-                stats.tx_backpressure.load(Ordering::Relaxed),
-                stats.quic_lost.load(Ordering::Relaxed),
-                stats.quic_retrans.load(Ordering::Relaxed),
-            );
-        }
-    })
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!(
-            "{}h {:02}m {:02}s",
-            secs / 3600,
-            (secs % 3600) / 60,
-            secs % 60
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,50 +1013,6 @@ mod tests {
                 .await
                 .is_err(),
             "readable readiness stayed set after recvmmsg returned EAGAIN"
-        );
-    }
-
-    #[test]
-    fn keepalive_can_be_disabled() {
-        assert_eq!(
-            keepalive_remaining(Duration::ZERO, Duration::from_secs(60)),
-            None
-        );
-    }
-
-    #[test]
-    fn keepalive_waits_only_for_remaining_probe_interval() {
-        assert_eq!(
-            keepalive_remaining(Duration::from_secs(25), Duration::from_secs(10)),
-            Some(Duration::from_secs(15))
-        );
-        assert_eq!(
-            keepalive_remaining(Duration::from_secs(25), Duration::from_secs(25)),
-            Some(Duration::ZERO)
-        );
-    }
-
-    #[test]
-    fn pmtud_revalidation_can_be_disabled_independently() {
-        assert_eq!(
-            pmtud_remaining(true, Duration::ZERO, Duration::from_secs(60)),
-            None
-        );
-        assert_eq!(
-            pmtud_remaining(false, Duration::from_secs(600), Duration::from_secs(60)),
-            None
-        );
-    }
-
-    #[test]
-    fn pmtud_revalidation_uses_remaining_period() {
-        assert_eq!(
-            pmtud_remaining(true, Duration::from_secs(600), Duration::from_secs(125)),
-            Some(Duration::from_secs(475))
-        );
-        assert_eq!(
-            pmtud_remaining(true, Duration::from_secs(600), Duration::from_secs(600)),
-            Some(Duration::ZERO)
         );
     }
 }
