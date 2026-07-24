@@ -75,7 +75,8 @@ pub struct NativeTunArgs {
     pub no_tunnel_ipv6: bool,
     #[arg(short = 's', long, default_value = internal::CONNECT_SNI)]
     pub sni_address: String,
-    /// Send an RFC 9000 QUIC PING after this much network inactivity.
+    /// Schedule an RFC 9000 QUIC PING at this interval to preserve QUIC and
+    /// outbound UDP/NAT state.
     /// Use 0s to disable keepalive.
     #[arg(short = 'k', long, default_value = "25s", value_parser = parse_duration)]
     pub keepalive_period: Duration,

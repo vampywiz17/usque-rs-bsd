@@ -903,12 +903,14 @@ async fn data_loop(
     let result: Result<()> = async {
         let mut tx_queue: VecDeque<TxDatagram> = VecDeque::with_capacity(tx_queue_len.min(65_536));
         let mut tun_reader_closed = false;
-        let mut last_network_activity = Instant::now();
+        // Drive keepalive from a periodic outbound deadline, not from received
+        // packets. Incoming traffic does not reliably refresh UDP/NAT state in
+        // the client-to-server direction, so postponing PING after a receive can
+        // let the path expire before the first probe is transmitted.
+        let mut last_keepalive_probe = Instant::now();
 
         loop {
-            if udp_batch.drain_quic(socket, endpoint, local_addr, conn)? > 0 {
-                last_network_activity = Instant::now();
-            }
+            udp_batch.drain_quic(socket, endpoint, local_addr, conn)?;
             poll_h3(conn, h3_conn);
             drain_incoming_datagrams(conn, flow_id, stats, dev).await;
 
@@ -937,7 +939,6 @@ async fn data_loop(
             );
             if progress.queued > 0 {
                 udp_batch.flush_quic(socket, conn).await?;
-                last_network_activity = Instant::now();
             } else if progress.backpressure {
                 // Quiche's DATAGRAM queue is full. Push already-queued QUIC packets
                 // out to UDP and then wait for ACKs/timers instead of burning CPU.
@@ -950,7 +951,12 @@ async fn data_loop(
             stats.quic_retrans.store(qs.retrans as u64, Ordering::Relaxed);
 
             if conn.is_closed() {
-                bail!("QUIC connection closed");
+                bail!(
+                    "QUIC connection closed (timed_out={}, local_error={:?}, peer_error={:?})",
+                    conn.is_timed_out(),
+                    conn.local_error(),
+                    conn.peer_error()
+                );
             }
             if tun_reader_closed && tx_queue.is_empty() {
                 bail!("TUN reader ended");
@@ -965,7 +971,7 @@ async fn data_loop(
 
             let quic_timeout = conn.timeout();
             let keepalive_wait =
-                keepalive_remaining(keepalive_period, last_network_activity.elapsed());
+                keepalive_remaining(keepalive_period, last_keepalive_probe.elapsed());
             let (timeout, quic_timeout_due) = match (quic_timeout, keepalive_wait) {
                 (Some(quic), Some(keepalive)) => {
                     (quic.min(keepalive), quic <= keepalive)
@@ -980,9 +986,7 @@ async fn data_loop(
             tokio::select! {
                 result = socket.readable() => {
                     result?;
-                    if udp_batch.drain_quic(socket, endpoint, local_addr, conn)? > 0 {
-                        last_network_activity = Instant::now();
-                    }
+                    udp_batch.drain_quic(socket, endpoint, local_addr, conn)?;
                 }
                 maybe_tx_dgram = tx_rx.recv(), if !tun_reader_closed && tx_queue.len() < tx_queue_len => {
                     match maybe_tx_dgram {
@@ -1002,7 +1006,7 @@ async fn data_loop(
 
                     if keepalive_remaining(
                         keepalive_period,
-                        last_network_activity.elapsed(),
+                        last_keepalive_probe.elapsed(),
                     ) == Some(Duration::ZERO) {
                         // RFC 9000 sections 10.1.2 and 19.2 explicitly define
                         // PING as an ack-eliciting connection keepalive. Keeping
@@ -1011,8 +1015,8 @@ async fn data_loop(
                         // platform backend.
                         conn.send_ack_eliciting()
                             .map_err(|e| anyhow!("failed to schedule QUIC keepalive PING: {e}"))?;
-                        tracing::debug!("scheduled QUIC keepalive PING");
-                        last_network_activity = Instant::now();
+                        tracing::debug!("scheduled periodic QUIC keepalive PING");
+                        last_keepalive_probe = Instant::now();
                         flush = true;
                     }
 
@@ -1302,11 +1306,11 @@ fn parse_datagram(dgram: &[u8], expected_flow_id: u64) -> Option<&[u8]> {
     Some(&dgram[off..])
 }
 
-fn keepalive_remaining(period: Duration, idle_for: Duration) -> Option<Duration> {
+fn keepalive_remaining(period: Duration, since_last_probe: Duration) -> Option<Duration> {
     if period.is_zero() {
         None
     } else {
-        Some(period.saturating_sub(idle_for))
+        Some(period.saturating_sub(since_last_probe))
     }
 }
 
@@ -1404,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_waits_only_for_remaining_idle_time() {
+    fn keepalive_waits_only_for_remaining_probe_interval() {
         assert_eq!(
             keepalive_remaining(Duration::from_secs(25), Duration::from_secs(10)),
             Some(Duration::from_secs(15))
