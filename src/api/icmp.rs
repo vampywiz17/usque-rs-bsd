@@ -101,3 +101,47 @@ fn icmpv6_checksum(src: &[u8], dst: &[u8], icmp: &[u8]) -> u16 {
     pseudo.extend_from_slice(icmp);
     checksum(&pseudo)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_frag_needed_quotes_packet_and_reports_mtu() {
+        let mut packet = vec![0u8; 100];
+        packet[0] = 0x45;
+        packet[8] = 63;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+
+        let reply = compose_icmp_too_large(&packet, 1280).unwrap();
+        assert_eq!(&reply[12..16], &[198, 51, 100, 2]);
+        assert_eq!(&reply[16..20], &[192, 0, 2, 1]);
+        assert_eq!(reply[20], ICMP_TYPE_DEST_UNREACHABLE);
+        assert_eq!(reply[21], ICMP_CODE_FRAG_NEEDED);
+        assert_eq!(u16::from_be_bytes([reply[24], reply[25]]), 1280);
+        assert_eq!(&reply[28..], packet.as_slice());
+        assert!(reply.len() <= 576);
+    }
+
+    #[test]
+    fn ipv6_packet_too_big_quotes_packet_and_reports_mtu() {
+        let mut packet = vec![0u8; 1400];
+        packet[0] = 0x60;
+        packet[7] = 63;
+        packet[8..24].copy_from_slice(&[0x20; 16]);
+        packet[24..40].copy_from_slice(&[0x30; 16]);
+
+        let reply = compose_icmp_too_large(&packet, 1280).unwrap();
+        assert_eq!(&reply[8..24], &[0x30; 16]);
+        assert_eq!(&reply[24..40], &[0x20; 16]);
+        assert_eq!(reply[40], ICMPV6_TYPE_PACKET_TOO_BIG);
+        assert_eq!(reply[41], 0);
+        assert_eq!(
+            u32::from_be_bytes([reply[44], reply[45], reply[46], reply[47]]),
+            1280
+        );
+        assert_eq!(reply.len(), 1280);
+        assert_eq!(&reply[48..], &packet[..1232]);
+    }
+}

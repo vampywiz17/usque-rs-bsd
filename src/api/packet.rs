@@ -110,3 +110,65 @@ fn calculate_ipv4_checksum(header: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ipv4_packet(ttl: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; IPV4_HEADER_LEN];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(IPV4_HEADER_LEN as u16).to_be_bytes());
+        packet[8] = ttl;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet
+    }
+
+    #[test]
+    fn outgoing_ipv4_decrements_ttl_and_updates_checksum() {
+        let mut packet = ipv4_packet(64);
+        assert_eq!(prepare_outgoing(&mut packet).unwrap(), 4);
+        assert_eq!(packet[8], 63);
+        assert_eq!(
+            u16::from_be_bytes([packet[10], packet[11]]),
+            calculate_ipv4_checksum(&packet)
+        );
+    }
+
+    #[test]
+    fn outgoing_ipv6_decrements_hop_limit() {
+        let mut packet = vec![0u8; IPV6_HEADER_LEN];
+        packet[0] = 0x60;
+        packet[7] = 64;
+        assert_eq!(prepare_outgoing(&mut packet).unwrap(), 6);
+        assert_eq!(packet[7], 63);
+    }
+
+    #[test]
+    fn outgoing_packet_rejects_expired_hop_count() {
+        let mut ipv4 = ipv4_packet(1);
+        assert!(matches!(
+            prepare_outgoing(&mut ipv4),
+            Err(PacketError::TtlExpired(1))
+        ));
+
+        let mut ipv6 = vec![0u8; IPV6_HEADER_LEN];
+        ipv6[0] = 0x60;
+        ipv6[7] = 1;
+        assert!(matches!(
+            prepare_outgoing(&mut ipv6),
+            Err(PacketError::TtlExpired(1))
+        ));
+    }
+
+    #[test]
+    fn packet_validation_rejects_empty_and_short_packets() {
+        assert!(matches!(validate_incoming(&[]), Err(PacketError::Empty)));
+        assert!(matches!(
+            validate_incoming(&[0x45; IPV4_HEADER_LEN - 1]),
+            Err(PacketError::TooShort { version: 4, len }) if len == IPV4_HEADER_LEN - 1
+        ));
+    }
+}

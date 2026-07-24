@@ -1548,4 +1548,35 @@ mod tests {
         d.extend_from_slice(b"payload");
         assert_eq!(parse_datagram(&d, 4), Some(b"payload".as_ref()));
     }
+
+    #[test]
+    fn flow_prefix_contains_quarter_stream_id_and_zero_context() {
+        let prefix = build_flow_prefix(64).unwrap();
+        let mut expected = encode_varint(64);
+        expected.extend_from_slice(&encode_varint(0));
+        assert_eq!(prefix, expected);
+    }
+
+    #[test]
+    fn parse_datagram_rejects_another_request_stream() {
+        let mut d = encode_varint(5);
+        d.extend_from_slice(&encode_varint(0));
+        d.extend_from_slice(b"payload");
+        assert_eq!(parse_datagram(&d, 4), None);
+    }
+
+    #[test]
+    fn parse_datagram_rejects_unknown_context() {
+        let mut d = encode_varint(4);
+        d.extend_from_slice(&encode_varint(2));
+        d.extend_from_slice(b"payload");
+        assert_eq!(parse_datagram(&d, 4), None);
+    }
+
+    #[test]
+    fn parse_datagram_rejects_missing_ip_payload() {
+        let mut d = encode_varint(4);
+        d.extend_from_slice(&encode_varint(0));
+        assert_eq!(parse_datagram(&d, 4), None);
+    }
 }
