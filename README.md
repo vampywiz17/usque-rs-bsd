@@ -35,7 +35,7 @@ bug fix that is not present upstream.
 | QUIC stack | `quiche` 0.22 with fixed 1350-byte UDP payloads | Pinned `quiche` 0.29.3 with RFC 8899 DPLPMTUD |
 | TUN MTU | Fixed at 1280 | Starts conservatively and follows quiche's writable DATAGRAM capacity up to the configured ceiling |
 | Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment and truthful FreeBSD metadata |
-| Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and native FreeBSD interface, CPU, memory and filesystem metrics |
+| Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
@@ -116,6 +116,8 @@ Metrics that cannot be measured truthfully with a supported FreeBSD or quiche AP
 are omitted rather than sent as zero. This currently includes peer-side
 downstream loss/retransmission, public ISP and gateway addresses, Wi-Fi and
 battery data, per-application resource usage and disk I/O rates.
+The native collector is compile-time gated to FreeBSD; verification builds on
+other operating systems retain the wire contract but return an empty snapshot.
 
 ## FreeBSD-tuned defaults
 

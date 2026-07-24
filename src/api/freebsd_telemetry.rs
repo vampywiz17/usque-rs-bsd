@@ -1,13 +1,22 @@
 //! Native FreeBSD host telemetry for Cloudflare device-state reporting.
 
+use std::net::IpAddr;
+
+#[cfg(target_os = "freebsd")]
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "freebsd")]
 use std::marker::PhantomData;
+#[cfg(target_os = "freebsd")]
 use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(target_os = "freebsd")]
+use std::net::{Ipv4Addr, Ipv6Addr};
+#[cfg(target_os = "freebsd")]
 use std::ptr;
+#[cfg(target_os = "freebsd")]
 use std::time::Instant;
 
 // FreeBSD <net/if_types.h>; libc does not currently export this constant.
+#[cfg(target_os = "freebsd")]
 const IFT_ETHER: u8 = 0x06;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -37,10 +46,13 @@ pub struct IpSnapshot {
 
 #[derive(Default)]
 pub struct HostTelemetryCollector {
+    #[cfg(target_os = "freebsd")]
     previous_cpu: Option<Vec<u64>>,
+    #[cfg(target_os = "freebsd")]
     previous_interface: Option<InterfaceCounters>,
 }
 
+#[cfg(target_os = "freebsd")]
 #[derive(Clone)]
 struct InterfaceCounters {
     name: String,
@@ -49,6 +61,7 @@ struct InterfaceCounters {
     sampled_at: Instant,
 }
 
+#[cfg(target_os = "freebsd")]
 impl HostTelemetryCollector {
     pub fn sample(&mut self, active_ip: Option<IpAddr>) -> HostSnapshot {
         let memory = memory_sample();
@@ -117,12 +130,32 @@ impl HostTelemetryCollector {
     }
 }
 
+#[cfg(not(target_os = "freebsd"))]
+impl HostTelemetryCollector {
+    pub fn sample(&mut self, _active_ip: Option<IpAddr>) -> HostSnapshot {
+        HostSnapshot::default()
+    }
+}
+
+#[cfg(all(test, not(target_os = "freebsd")))]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_platform_omits_native_metrics() {
+        let mut collector = HostTelemetryCollector::default();
+        assert_eq!(collector.sample(None), HostSnapshot::default());
+    }
+}
+
+#[cfg(target_os = "freebsd")]
 fn rate(bytes: u64, elapsed_seconds: f64) -> u64 {
     (bytes as f64 / elapsed_seconds)
         .clamp(0.0, u64::MAX as f64)
         .round() as u64
 }
 
+#[cfg(target_os = "freebsd")]
 fn connection_type(interface_type: u8) -> &'static str {
     if interface_type == IFT_ETHER {
         "ethernet"
@@ -131,8 +164,10 @@ fn connection_type(interface_type: u8) -> &'static str {
     }
 }
 
+#[cfg(target_os = "freebsd")]
 struct InterfaceAddresses(*mut libc::ifaddrs);
 
+#[cfg(target_os = "freebsd")]
 impl InterfaceAddresses {
     unsafe fn load() -> Option<Self> {
         let mut head = ptr::null_mut();
@@ -195,17 +230,20 @@ impl InterfaceAddresses {
     }
 }
 
+#[cfg(target_os = "freebsd")]
 impl Drop for InterfaceAddresses {
     fn drop(&mut self) {
         unsafe { libc::freeifaddrs(self.0) };
     }
 }
 
+#[cfg(target_os = "freebsd")]
 struct InterfaceIterator<'a> {
     current: *mut libc::ifaddrs,
     owner: PhantomData<&'a libc::ifaddrs>,
 }
 
+#[cfg(target_os = "freebsd")]
 impl<'a> Iterator for InterfaceIterator<'a> {
     type Item = &'a libc::ifaddrs;
 
@@ -219,6 +257,7 @@ impl<'a> Iterator for InterfaceIterator<'a> {
     }
 }
 
+#[cfg(target_os = "freebsd")]
 fn interface_name(entry: &libc::ifaddrs) -> Option<String> {
     (!entry.ifa_name.is_null()).then(|| unsafe {
         CStr::from_ptr(entry.ifa_name)
@@ -227,6 +266,7 @@ fn interface_name(entry: &libc::ifaddrs) -> Option<String> {
     })
 }
 
+#[cfg(target_os = "freebsd")]
 fn sockaddr_ip(address: *const libc::sockaddr) -> Option<IpAddr> {
     if address.is_null() {
         return None;
@@ -246,6 +286,7 @@ fn sockaddr_ip(address: *const libc::sockaddr) -> Option<IpAddr> {
     }
 }
 
+#[cfg(target_os = "freebsd")]
 fn prefix_length(netmask: *const libc::sockaddr) -> Option<u32> {
     match sockaddr_ip(netmask)? {
         IpAddr::V4(mask) => Some(u32::from(mask).count_ones()),
@@ -253,6 +294,7 @@ fn prefix_length(netmask: *const libc::sockaddr) -> Option<u32> {
     }
 }
 
+#[cfg(target_os = "freebsd")]
 fn memory_sample() -> Option<(f32, u64)> {
     let physical = sysctl_unsigned("hw.physmem")?;
     let page_size = sysctl_unsigned("hw.pagesize")?;
@@ -274,6 +316,7 @@ fn memory_sample() -> Option<(f32, u64)> {
     Some((used_fraction.clamp(0.0, 1.0) as f32, available / 1024))
 }
 
+#[cfg(target_os = "freebsd")]
 fn disk_usage_sample() -> Option<f32> {
     let path = CString::new("/").ok()?;
     let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
@@ -284,11 +327,13 @@ fn disk_usage_sample() -> Option<f32> {
     Some((used as f64 / stats.f_blocks as f64).clamp(0.0, 1.0) as f32)
 }
 
+#[cfg(target_os = "freebsd")]
 fn sysctl_unsigned(name: &str) -> Option<u64> {
     let values = sysctl_unsigned_array(name)?;
     values.first().copied()
 }
 
+#[cfg(target_os = "freebsd")]
 fn sysctl_unsigned_array(name: &str) -> Option<Vec<u64>> {
     let name = CString::new(name).ok()?;
     let mut size = 0usize;
@@ -340,7 +385,7 @@ fn sysctl_unsigned_array(name: &str) -> Option<Vec<u64>> {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::*;
 
