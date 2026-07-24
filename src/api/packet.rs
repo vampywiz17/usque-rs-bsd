@@ -28,7 +28,10 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
     match ip_version(buf) {
         4 => {
             if buf.len() < IPV4_HEADER_LEN {
-                return Err(PacketError::TooShort { version: 4, len: buf.len() });
+                return Err(PacketError::TooShort {
+                    version: 4,
+                    len: buf.len(),
+                });
             }
             let ttl = buf[8];
             if ttl <= 1 {
@@ -41,7 +44,10 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
         }
         6 => {
             if buf.len() < IPV6_HEADER_LEN {
-                return Err(PacketError::TooShort { version: 6, len: buf.len() });
+                return Err(PacketError::TooShort {
+                    version: 6,
+                    len: buf.len(),
+                });
             }
             let hop_limit = buf[7];
             if hop_limit <= 1 {
@@ -61,13 +67,19 @@ pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
     match ip_version(buf) {
         4 => {
             if buf.len() < IPV4_HEADER_LEN {
-                return Err(PacketError::TooShort { version: 4, len: buf.len() });
+                return Err(PacketError::TooShort {
+                    version: 4,
+                    len: buf.len(),
+                });
             }
             Ok(4)
         }
         6 => {
             if buf.len() < IPV6_HEADER_LEN {
-                return Err(PacketError::TooShort { version: 6, len: buf.len() });
+                return Err(PacketError::TooShort {
+                    version: 6,
+                    len: buf.len(),
+                });
             }
             Ok(6)
         }

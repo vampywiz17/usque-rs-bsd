@@ -1,4 +1,5 @@
 use crate::api::cloudflare::{self, EnrollFailure};
+use crate::api::device_state::DeviceStateReporter;
 use crate::api::masque::{maintain_native_tun, MasqueConfig};
 use crate::api::tunnel::TunnelDevice;
 use crate::config::{self, AppConfig};
@@ -313,6 +314,19 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         config::warn_insecure();
     }
 
+    let device_state = match DeviceStateReporter::start(&cfg, args.always_reconnect).await {
+        Ok(reporter) => {
+            tracing::info!("Cloudflare device-state reporting enabled (TunnelOnly/MASQUE)");
+            Some(reporter)
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Cloudflare device-state reporting is unavailable; tunnel operation will continue: {err:#}"
+            );
+            None
+        }
+    };
+
     let tun = TunRsDevice::create(
         &cfg,
         TunOptions {
@@ -376,6 +390,7 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         on_connect: non_empty(args.on_connect),
         on_disconnect: non_empty(args.on_disconnect),
         hook_env,
+        device_state,
     };
 
     tracing::info!("Tunnel device is ready; starting MASQUE packet pump");

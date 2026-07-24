@@ -1,3 +1,4 @@
+use crate::api::device_state::DeviceStateReporter;
 use crate::api::hooks::run_hook;
 use crate::api::{icmp, packet};
 use crate::config::{AppConfig, MasqueEndpoint};
@@ -57,6 +58,7 @@ pub struct MasqueConfig {
     pub on_connect: Option<String>,
     pub on_disconnect: Option<String>,
     pub hook_env: HashMap<String, String>,
+    pub device_state: Option<DeviceStateReporter>,
 }
 
 struct TlsMaterial {
@@ -511,6 +513,7 @@ async fn run_tunnel_session(
     mtu: usize,
     pending_pkt: &mut Option<Vec<u8>>,
 ) -> Result<()> {
+    let connection_started = Instant::now();
     let endpoint = selected_endpoint.addr.0;
     let tls_material = prepare_tls_material(cfg, selected_endpoint)?;
 
@@ -685,6 +688,9 @@ async fn run_tunnel_session(
     .await?;
 
     tracing::info!("Connected to MASQUE server");
+    if let Some(reporter) = &cfg.device_state {
+        reporter.connected(connection_started.elapsed());
+    }
     if let Some(path) = &cfg.on_connect {
         let mut env = cfg.hook_env.clone();
         env.insert("USQUE_EVENT".to_string(), "connect".to_string());
@@ -736,6 +742,9 @@ async fn run_tunnel_session(
     .await;
 
     stats_handle.abort();
+    if let Some(reporter) = &cfg.device_state {
+        reporter.disconnected();
+    }
     if let Some(path) = &cfg.on_disconnect {
         let mut env = cfg.hook_env.clone();
         env.insert("USQUE_EVENT".to_string(), "disconnect".to_string());

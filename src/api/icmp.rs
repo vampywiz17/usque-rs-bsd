@@ -23,7 +23,9 @@ fn compose_ipv4_frag_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
 
     let src = &packet[12..16];
     let dst = &packet[16..20];
-    let quote_len = packet.len().min(576usize.saturating_sub(IPV4_HEADER_LEN + ICMP_HEADER_LEN));
+    let quote_len = packet
+        .len()
+        .min(576usize.saturating_sub(IPV4_HEADER_LEN + ICMP_HEADER_LEN));
     let total_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + quote_len;
     let mut out = vec![0u8; total_len];
 

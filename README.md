@@ -13,6 +13,7 @@ The project provides a native TUN tunnel for Cloudflare WARP's MASQUE/CONNECT-IP
 - FreeBSD as the primary target
 - Cloudflare registration and MASQUE key enrollment
 - Stable FreeBSD device identity and MASQUE-native registration metadata
+- Cloudflare device orchestration status for TunnelOnly/MASQUE sessions
 - QUIC/HTTP/3 MASQUE `cf-connect-ip` tunnel
 - RFC 8899 DPLPMTUD with dynamic native TUN MTU updates
 - IPv4 and IPv6 packet handling
@@ -34,6 +35,7 @@ bug fix that is not present upstream.
 | QUIC stack | `quiche` 0.22 with fixed 1350-byte UDP payloads | Pinned `quiche` 0.29.3 with RFC 8899 DPLPMTUD |
 | TUN MTU | Fixed at 1280 | Starts conservatively and follows quiche's writable DATAGRAM capacity up to the configured ceiling |
 | Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment and truthful FreeBSD metadata |
+| Device monitoring | No Cloudflare device-state integration | Out-of-tunnel HTTPS orchestration heartbeat tied to the real MASQUE session lifecycle (`Connected`/`Disconnected`, `tunnel_only`, `masque`) |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
@@ -93,6 +95,20 @@ RUST_LOG=info ./target/release/usque-nativetun nativetun \
 ```
 
 The application configures interface addresses and MTU, but does not manage the system's routing policy. Routes must be configured separately for the intended setup.
+
+## Cloudflare device monitoring
+
+Native TUN mode uses Cloudflare's separate, out-of-tunnel HTTPS orchestration
+connection to report the real MASQUE session lifecycle. It sends an immediate
+update on connect/disconnect and a 60-second heartbeat while running, using
+`Connected`/`Disconnected`, `tunnel_only` and `masque` values from the current
+Cloudflare One Client device-state contract. Reporting failures are logged but
+never terminate or reconnect the QUIC tunnel.
+
+This first implementation intentionally covers connection health, mode, tunnel
+type, profile and handshake latency only. Hardware and per-interface telemetry
+collectors are not implemented yet; the reporter does not invent Wi-Fi,
+battery, application or interface data.
 
 ## FreeBSD-tuned defaults
 

@@ -106,7 +106,41 @@ pub async fn enroll_key(
         .map_err(|e| EnrollFailure::Transport(anyhow!("failed to decode enroll response: {e}")))
 }
 
-fn client_headers(req: RequestBuilder) -> RequestBuilder {
+/// Fetch the current registration and device policy through Cloudflare's
+/// orchestration connection. This HTTPS request intentionally remains
+/// independent from the MASQUE data plane.
+pub async fn get_registration(registration_id: &str, access_token: &str) -> Result<AccountData> {
+    let client = Client::new();
+    let url = format!(
+        "{}/{}/reg/{}",
+        internal::api_url(),
+        internal::api_version(),
+        registration_id
+    );
+    let resp = client_headers(client.get(url))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("failed to fetch device registration")?;
+    let status = resp.status();
+    let body = resp
+        .bytes()
+        .await
+        .context("failed to read device registration response")?;
+
+    if status != StatusCode::OK {
+        let api_err = serde_json::from_slice::<ApiError>(&body).unwrap_or_default();
+        return Err(anyhow!(
+            "failed to fetch device registration: {status}; API errors: {}",
+            api_err.errors_as_string("; ")
+        ));
+    }
+
+    serde_json::from_slice::<AccountData>(&body)
+        .context("failed to decode device registration response")
+}
+
+pub(crate) fn client_headers(req: RequestBuilder) -> RequestBuilder {
     req.header("User-Agent", internal::client_user_agent())
         .header("CF-Client-Version", env!("CARGO_PKG_VERSION"))
         .header("Content-Type", "application/json; charset=UTF-8")

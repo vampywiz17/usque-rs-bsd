@@ -207,5 +207,11 @@ pub struct Endpoint {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Policy {
     #[serde(default)]
+    pub policy_id: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub switch_locked: bool,
+    #[serde(default)]
     pub tunnel_protocol: String,
 }
