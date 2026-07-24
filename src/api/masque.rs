@@ -1,10 +1,12 @@
 mod connect_ip;
+mod supervisor;
 mod udp;
+pub use supervisor::maintain_native_tun;
 
 use crate::api::device_state::DeviceStateReporter;
 use crate::api::hooks::run_hook;
 use crate::api::{icmp, packet};
-use crate::config::{AppConfig, MasqueEndpoint};
+use crate::config::MasqueEndpoint;
 use crate::native_tun::TunRsDevice;
 use anyhow::{anyhow, bail, Context, Result};
 use connect_ip::{build_flow_prefix, parse_datagram};
@@ -27,36 +29,55 @@ const DGRAM_QUEUE_LEN: usize = 16_384;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
 const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
 
-#[derive(Clone)]
-pub struct MasqueConfig {
-    pub private_key: SecretKey,
-    pub sni: String,
-    pub insecure: bool,
-    pub endpoints: Vec<MasqueEndpoint>,
+pub struct QuicTransportConfig {
     pub keepalive_period: Duration,
     pub initial_packet_size: u16,
-    pub enable_pmtud: bool,
-    pub pmtud_max_probes: u8,
-    pub pmtud_revalidate_period: Duration,
-    pub initial_tun_mtu: u16,
-    pub max_tun_mtu: u16,
-    pub user_agent: String,
     pub cc_algorithm: String,
     pub initial_cwnd_packets: usize,
-    pub disable_quic_pacing: bool,
+    pub disable_pacing: bool,
     pub relaxed_loss: bool,
     pub send_capacity_factor: f64,
     pub max_pacing_rate_bps: u64,
+}
+
+pub struct PathMtuConfig {
+    pub enabled: bool,
+    pub max_probes: u8,
+    pub revalidate_period: Duration,
+    pub initial_tun_mtu: u16,
+    pub max_tun_mtu: u16,
+}
+
+pub struct DatagramIoConfig {
     pub udp_socket_buffer: usize,
     pub tx_queue_len: usize,
     pub tx_burst_packets: usize,
     pub packet_buffer_pool_size: usize,
     pub udp_batch_size: usize,
-    pub reconnect_delay: Duration,
-    pub always_reconnect: bool,
+}
+
+pub struct ReconnectPolicy {
+    pub delay: Duration,
+    pub always: bool,
+}
+
+pub struct LifecycleHooks {
     pub on_connect: Option<String>,
     pub on_disconnect: Option<String>,
-    pub hook_env: HashMap<String, String>,
+    pub env: HashMap<String, String>,
+}
+
+pub struct MasqueConfig {
+    pub private_key: SecretKey,
+    pub sni: String,
+    pub insecure: bool,
+    pub endpoints: Vec<MasqueEndpoint>,
+    pub user_agent: String,
+    pub quic: QuicTransportConfig,
+    pub path_mtu: PathMtuConfig,
+    pub io: DatagramIoConfig,
+    pub reconnect: ReconnectPolicy,
+    pub hooks: LifecycleHooks,
     pub device_state: Option<DeviceStateReporter>,
 }
 
@@ -103,52 +124,6 @@ struct TxDatagram {
 struct TxProgress {
     queued: usize,
     backpressure: bool,
-}
-
-pub async fn maintain_native_tun(
-    _app_cfg: &AppConfig,
-    cfg: MasqueConfig,
-    dev: Arc<TunRsDevice>,
-    mtu: usize,
-) -> Result<()> {
-    let mut pending_pkt: Option<Vec<u8>> = None;
-    let mut endpoint_index = 0usize;
-
-    loop {
-        if !cfg.always_reconnect && pending_pkt.is_none() {
-            tracing::info!("Tunnel idle. Waiting for outbound activity before reconnecting...");
-            let mut wait_buf = vec![0u8; mtu + 128];
-            let n = dev.recv_packet(&mut wait_buf).await?;
-            if n == 0 {
-                bail!("TUN device closed");
-            }
-            wait_buf.truncate(n);
-            pending_pkt = Some(wait_buf);
-            tracing::info!("Detected outbound activity ({n} bytes). Connecting...");
-        }
-
-        let endpoint = cfg
-            .endpoints
-            .get(endpoint_index)
-            .ok_or_else(|| anyhow!("MASQUE endpoint list is empty"))?;
-        tracing::info!(
-            "Establishing MASQUE connection to {} ({}/{}){}",
-            endpoint.addr,
-            endpoint_index + 1,
-            cfg.endpoints.len(),
-            if endpoint.host.is_empty() {
-                String::new()
-            } else {
-                format!(" for {}", endpoint.host)
-            }
-        );
-        match run_tunnel_session(&cfg, endpoint, &dev, mtu, &mut pending_pkt).await {
-            Ok(()) => tracing::warn!("MASQUE session ended. Reconnecting..."),
-            Err(err) => tracing::warn!("MASQUE session failed: {err:#}. Reconnecting..."),
-        }
-        endpoint_index = (endpoint_index + 1) % cfg.endpoints.len();
-        tokio::time::sleep(cfg.reconnect_delay).await;
-    }
 }
 
 fn prepare_tls_material(cfg: &MasqueConfig, endpoint: &MasqueEndpoint) -> Result<TlsMaterial> {
@@ -219,16 +194,16 @@ async fn run_tunnel_session(
         .map_err(|e| anyhow!("load client private key: {e}"))?;
 
     quic_config.set_max_idle_timeout(0);
-    let udp_payload = if cfg.initial_packet_size > 0 {
-        usize::from(cfg.initial_packet_size)
+    let udp_payload = if cfg.quic.initial_packet_size > 0 {
+        usize::from(cfg.quic.initial_packet_size)
     } else {
         MAX_DATAGRAM_SIZE
     };
     quic_config.set_max_recv_udp_payload_size(udp_payload);
     quic_config.set_max_send_udp_payload_size(udp_payload);
-    quic_config.discover_pmtu(cfg.enable_pmtud);
-    if cfg.enable_pmtud {
-        quic_config.set_pmtud_max_probes(cfg.pmtud_max_probes);
+    quic_config.discover_pmtu(cfg.path_mtu.enabled);
+    if cfg.path_mtu.enabled {
+        quic_config.set_pmtud_max_probes(cfg.path_mtu.max_probes);
     }
     quic_config.set_initial_max_data(64_000_000);
     quic_config.set_initial_max_stream_data_bidi_local(8_000_000);
@@ -236,62 +211,65 @@ async fn run_tunnel_session(
     quic_config.set_initial_max_stream_data_uni(8_000_000);
     quic_config.set_initial_max_streams_bidi(100);
     quic_config.set_initial_max_streams_uni(100);
-    if !cfg.cc_algorithm.trim().is_empty() {
+    if !cfg.quic.cc_algorithm.trim().is_empty() {
         quic_config
-            .set_cc_algorithm_name(cfg.cc_algorithm.trim())
+            .set_cc_algorithm_name(cfg.quic.cc_algorithm.trim())
             .map_err(|e| {
                 anyhow!(
                     "set QUIC congestion-control algorithm '{}': {e}",
-                    cfg.cc_algorithm.trim()
+                    cfg.quic.cc_algorithm.trim()
                 )
             })?;
     }
-    quic_config.set_initial_congestion_window_packets(cfg.initial_cwnd_packets);
-    if cfg.disable_quic_pacing {
+    quic_config.set_initial_congestion_window_packets(cfg.quic.initial_cwnd_packets);
+    if cfg.quic.disable_pacing {
         quic_config.enable_pacing(false);
     }
-    if cfg.relaxed_loss {
+    if cfg.quic.relaxed_loss {
         quic_config.set_enable_relaxed_loss_threshold(true);
     }
-    if cfg.send_capacity_factor > 0.0 && (cfg.send_capacity_factor - 1.0).abs() > f64::EPSILON {
-        quic_config.set_send_capacity_factor(cfg.send_capacity_factor);
+    if cfg.quic.send_capacity_factor > 0.0
+        && (cfg.quic.send_capacity_factor - 1.0).abs() > f64::EPSILON
+    {
+        quic_config.set_send_capacity_factor(cfg.quic.send_capacity_factor);
     }
-    if cfg.max_pacing_rate_bps > 0 {
+    if cfg.quic.max_pacing_rate_bps > 0 {
         // quiche 0.29 interprets this API as an integer number of Mbit/s,
         // while our CLI intentionally exposes bits per second. Round down so
         // the configured ceiling is never exceeded, with 1 Mbit/s as the
         // smallest non-zero value supported by quiche.
-        let max_pacing_rate_mbps = (cfg.max_pacing_rate_bps / 1_000_000).max(1);
+        let max_pacing_rate_mbps = (cfg.quic.max_pacing_rate_bps / 1_000_000).max(1);
         quic_config.set_max_pacing_rate(max_pacing_rate_mbps);
     }
     let packet_buffer_pool_size = cfg
+        .io
         .packet_buffer_pool_size
         .clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
-    let tx_queue_len = cfg.tx_queue_len.max(1).min(packet_buffer_pool_size);
+    let tx_queue_len = cfg.io.tx_queue_len.max(1).min(packet_buffer_pool_size);
     tracing::info!(
         "QUIC tuning: quiche=0.29.3 cc={} initial_cwnd_packets={} max_udp_payload={} pmtud={} pmtud_max_probes={} initial_tun_mtu={} max_tun_mtu={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
-        cfg.cc_algorithm.trim(),
-        cfg.initial_cwnd_packets,
+        cfg.quic.cc_algorithm.trim(),
+        cfg.quic.initial_cwnd_packets,
         udp_payload,
-        cfg.enable_pmtud,
-        cfg.pmtud_max_probes,
-        cfg.initial_tun_mtu,
-        cfg.max_tun_mtu,
+        cfg.path_mtu.enabled,
+        cfg.path_mtu.max_probes,
+        cfg.path_mtu.initial_tun_mtu,
+        cfg.path_mtu.max_tun_mtu,
         DGRAM_QUEUE_LEN,
         tx_queue_len,
-        cfg.tx_burst_packets,
+        cfg.io.tx_burst_packets,
         packet_buffer_pool_size,
-        cfg.udp_batch_size.clamp(1, MAX_UDP_BATCH_SIZE),
-        if cfg.disable_quic_pacing { "off" } else { "on" },
-        cfg.relaxed_loss,
-        cfg.send_capacity_factor,
-        cfg.max_pacing_rate_bps,
-        cfg.udp_socket_buffer,
+        cfg.io.udp_batch_size.clamp(1, MAX_UDP_BATCH_SIZE),
+        if cfg.quic.disable_pacing { "off" } else { "on" },
+        cfg.quic.relaxed_loss,
+        cfg.quic.send_capacity_factor,
+        cfg.quic.max_pacing_rate_bps,
+        cfg.io.udp_socket_buffer,
     );
     quic_config.set_disable_active_migration(true);
     quic_config.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
-    let socket = create_connected_udp_socket(endpoint, cfg.udp_socket_buffer)?;
+    let socket = create_connected_udp_socket(endpoint, cfg.io.udp_socket_buffer)?;
     let local_addr = socket.local_addr()?;
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
@@ -311,7 +289,7 @@ async fn run_tunnel_session(
 
     let mut out = vec![0u8; MAX_DATAGRAM_SIZE.max(udp_payload)];
     let mut buf = vec![0u8; 65_535];
-    let mut udp_batch = UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.udp_batch_size);
+    let mut udp_batch = UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.io.udp_batch_size);
 
     let (write, send_info) = conn
         .send(&mut out)
@@ -379,8 +357,8 @@ async fn run_tunnel_session(
     if let Some(reporter) = &cfg.device_state {
         reporter.connected(connection_started.elapsed());
     }
-    if let Some(path) = &cfg.on_connect {
-        let mut env = cfg.hook_env.clone();
+    if let Some(path) = &cfg.hooks.on_connect {
+        let mut env = cfg.hooks.env.clone();
         env.insert("USQUE_EVENT".to_string(), "connect".to_string());
         env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
         run_hook(path, &env);
@@ -418,12 +396,12 @@ async fn run_tunnel_session(
         &flow_prefix,
         flow_id,
         &stats,
-        cfg.keepalive_period,
-        cfg.enable_pmtud,
-        cfg.pmtud_revalidate_period,
-        cfg.max_tun_mtu,
+        cfg.quic.keepalive_period,
+        cfg.path_mtu.enabled,
+        cfg.path_mtu.revalidate_period,
+        cfg.path_mtu.max_tun_mtu,
         tx_queue_len,
-        cfg.tx_burst_packets.max(1),
+        cfg.io.tx_burst_packets.max(1),
         packet_buffer_pool_size,
         &mut udp_batch,
     )
@@ -433,8 +411,8 @@ async fn run_tunnel_session(
     if let Some(reporter) = &cfg.device_state {
         reporter.disconnected();
     }
-    if let Some(path) = &cfg.on_disconnect {
-        let mut env = cfg.hook_env.clone();
+    if let Some(path) = &cfg.hooks.on_disconnect {
+        let mut env = cfg.hooks.env.clone();
         env.insert("USQUE_EVENT".to_string(), "disconnect".to_string());
         env.insert("USQUE_ENDPOINT".to_string(), endpoint.to_string());
         run_hook(path, &env);

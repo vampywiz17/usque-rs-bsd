@@ -1,6 +1,9 @@
 use crate::api::cloudflare::{self, EnrollFailure};
 use crate::api::device_state::DeviceStateReporter;
-use crate::api::masque::{maintain_native_tun, MasqueConfig};
+use crate::api::masque::{
+    maintain_native_tun, DatagramIoConfig, LifecycleHooks, MasqueConfig, PathMtuConfig,
+    QuicTransportConfig, ReconnectPolicy,
+};
 use crate::api::tunnel::TunnelDevice;
 use crate::config::{self, AppConfig};
 use crate::internal;
@@ -359,13 +362,6 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         sni: args.sni_address,
         insecure: args.insecure,
         endpoints,
-        keepalive_period: args.keepalive_period,
-        initial_packet_size: args.initial_packet_size,
-        enable_pmtud: !args.disable_pmtud,
-        pmtud_max_probes: args.pmtud_max_probes,
-        pmtud_revalidate_period: args.pmtud_revalidate_period,
-        initial_tun_mtu: args.mtu,
-        max_tun_mtu: args.max_tun_mtu,
         user_agent: if cfg.device_identity.client_version.is_empty() {
             internal::client_user_agent()
         } else {
@@ -374,27 +370,44 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
                 cfg.device_identity.client_version
             )
         },
-        cc_algorithm: args.cc,
-        initial_cwnd_packets: args.initial_cwnd_packets,
-        disable_quic_pacing: args.disable_quic_pacing,
-        relaxed_loss: args.relaxed_loss,
-        send_capacity_factor: args.send_capacity_factor,
-        max_pacing_rate_bps: args.max_pacing_rate_bps,
-        udp_socket_buffer: args.udp_socket_buffer,
-        tx_queue_len: args.tx_queue_len,
-        tx_burst_packets: args.tx_burst_packets,
-        packet_buffer_pool_size: args.packet_buffer_pool_size,
-        udp_batch_size: args.udp_batch_size,
-        reconnect_delay: args.reconnect_delay,
-        always_reconnect: args.always_reconnect,
-        on_connect: non_empty(args.on_connect),
-        on_disconnect: non_empty(args.on_disconnect),
-        hook_env,
+        quic: QuicTransportConfig {
+            keepalive_period: args.keepalive_period,
+            initial_packet_size: args.initial_packet_size,
+            cc_algorithm: args.cc,
+            initial_cwnd_packets: args.initial_cwnd_packets,
+            disable_pacing: args.disable_quic_pacing,
+            relaxed_loss: args.relaxed_loss,
+            send_capacity_factor: args.send_capacity_factor,
+            max_pacing_rate_bps: args.max_pacing_rate_bps,
+        },
+        path_mtu: PathMtuConfig {
+            enabled: !args.disable_pmtud,
+            max_probes: args.pmtud_max_probes,
+            revalidate_period: args.pmtud_revalidate_period,
+            initial_tun_mtu: args.mtu,
+            max_tun_mtu: args.max_tun_mtu,
+        },
+        io: DatagramIoConfig {
+            udp_socket_buffer: args.udp_socket_buffer,
+            tx_queue_len: args.tx_queue_len,
+            tx_burst_packets: args.tx_burst_packets,
+            packet_buffer_pool_size: args.packet_buffer_pool_size,
+            udp_batch_size: args.udp_batch_size,
+        },
+        reconnect: ReconnectPolicy {
+            delay: args.reconnect_delay,
+            always: args.always_reconnect,
+        },
+        hooks: LifecycleHooks {
+            on_connect: non_empty(args.on_connect),
+            on_disconnect: non_empty(args.on_disconnect),
+            env: hook_env,
+        },
         device_state,
     };
 
     tracing::info!("Tunnel device is ready; starting MASQUE packet pump");
-    maintain_native_tun(&cfg, masque, tun, args.max_tun_mtu as usize).await
+    maintain_native_tun(masque, tun, args.max_tun_mtu as usize).await
 }
 
 async fn enroll_or_fail(
