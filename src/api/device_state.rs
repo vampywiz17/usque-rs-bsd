@@ -1,4 +1,6 @@
 use crate::api::cloudflare;
+use crate::api::freebsd_telemetry::InterfaceSnapshot;
+use crate::api::freebsd_telemetry::{HostSnapshot, HostTelemetryCollector, IpSnapshot};
 use crate::config::AppConfig;
 use crate::internal;
 use anyhow::{anyhow, Context, Result};
@@ -6,6 +8,8 @@ use chrono::{SecondsFormat, Utc};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -22,6 +26,7 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct DeviceStateReporter {
     state_tx: watch::Sender<ConnectionState>,
+    tunnel_metrics: Arc<RwLock<Option<TunnelMetrics>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +47,26 @@ struct ReporterConfig {
     client_version: String,
 }
 
+/// Cumulative, directly observed statistics for the active QUIC path.
+///
+/// Values retain quiche's units and semantics. Unknown peer-side loss and
+/// retransmission counters are deliberately not represented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TunnelMetrics {
+    pub local_ip: IpAddr,
+    pub rtt_us: u64,
+    pub min_rtt_us: Option<u64>,
+    pub rtt_var_us: u64,
+    pub packets_sent_upstream: u64,
+    pub packets_received_downstream: u64,
+    pub packets_lost_upstream: u64,
+    pub packets_retransmitted_upstream: u64,
+    pub bytes_sent_upstream: u64,
+    pub bytes_received_downstream: u64,
+    pub bytes_lost_upstream: u64,
+    pub bytes_retransmitted_upstream: u64,
+}
+
 #[derive(Serialize)]
 struct DeviceStatePayload<'a> {
     timestamp: String,
@@ -57,23 +82,90 @@ struct DeviceStatePayload<'a> {
     warp_metal: &'static str,
     warp_colo: &'static str,
     handshake_latency_ms: Option<u64>,
-    estimated_loss: Option<f32>,
+    estimated_loss: Option<f64>,
     tunnel_type: &'static str,
     interfaces: Vec<InterfaceInfo>,
     firewalls: BTreeMap<String, bool>,
-    cpu_pct: f32,
-    cpu_pct_by_app: Vec<AppCpuUsage>,
-    ram_used_pct: f32,
-    ram_used_pct_by_app: Vec<AppRamUsage>,
-    ram_available_kb: u64,
-    disk_usage_pct: f32,
-    disk_read_bps: u64,
-    disk_write_bps: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel_stats_upstream: Option<TunnelStatsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tunnel_stats_downstream: Option<TunnelStatsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pct_by_app: Option<Vec<AppCpuUsage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_used_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_used_pct_by_app: Option<Vec<AppRamUsage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_available_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_usage_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_read_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_write_bps: Option<u64>,
     profile_id: &'a str,
 }
 
 #[derive(Serialize)]
-struct InterfaceInfo {}
+struct InterfaceInfo {
+    name: String,
+    connection_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_sent_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_rcvd_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_ipv4: Option<IpInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_ipv6: Option<IpInfo>,
+}
+
+#[derive(Serialize)]
+struct IpInfo {
+    address: String,
+    netmask: String,
+}
+
+impl From<InterfaceSnapshot> for InterfaceInfo {
+    fn from(value: InterfaceSnapshot) -> Self {
+        Self {
+            name: value.name,
+            connection_type: value.connection_type,
+            network_sent_bps: value.network_sent_bps,
+            network_rcvd_bps: value.network_rcvd_bps,
+            device_ipv4: value.device_ipv4.map(ip_info),
+            device_ipv6: value.device_ipv6.map(ip_info),
+        }
+    }
+}
+
+fn ip_info(value: IpSnapshot) -> IpInfo {
+    IpInfo {
+        address: value.address,
+        netmask: value.netmask,
+    }
+}
+
+#[derive(Serialize)]
+struct TunnelStatsPayload {
+    rtt_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_rtt_us: Option<u64>,
+    rtt_var_us: u64,
+    packets_sent: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packets_lost: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packets_retransmitted: Option<u64>,
+    bytes_sent: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_lost: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_retransmitted: Option<u64>,
+}
 
 #[derive(Serialize)]
 struct AppCpuUsage {}
@@ -120,8 +212,12 @@ impl DeviceStateReporter {
         };
 
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
-        tokio::spawn(run_reporter(cfg, state_rx));
-        Ok(Self { state_tx })
+        let tunnel_metrics = Arc::new(RwLock::new(None));
+        tokio::spawn(run_reporter(cfg, state_rx, tunnel_metrics.clone()));
+        Ok(Self {
+            state_tx,
+            tunnel_metrics,
+        })
     }
 
     pub fn connected(&self, handshake_latency: Duration) {
@@ -132,34 +228,58 @@ impl DeviceStateReporter {
     }
 
     pub fn disconnected(&self) {
+        if let Ok(mut metrics) = self.tunnel_metrics.write() {
+            *metrics = None;
+        }
         self.state_tx.send_replace(ConnectionState::Disconnected);
+    }
+
+    pub fn update_tunnel_metrics(&self, sample: TunnelMetrics) {
+        if let Ok(mut metrics) = self.tunnel_metrics.write() {
+            *metrics = Some(sample);
+        }
     }
 }
 
-async fn run_reporter(cfg: ReporterConfig, mut state_rx: watch::Receiver<ConnectionState>) {
+async fn run_reporter(
+    cfg: ReporterConfig,
+    mut state_rx: watch::Receiver<ConnectionState>,
+    tunnel_metrics: Arc<RwLock<Option<TunnelMetrics>>>,
+) {
     let client = Client::new();
     let mut interval = tokio::time::interval(REPORT_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut host_collector = HostTelemetryCollector::default();
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let state = *state_rx.borrow();
-                report_current_state(&client, &cfg, state).await;
+                let metrics = tunnel_metrics.read().ok().and_then(|value| *value);
+                let host = host_collector.sample(metrics.map(|sample| sample.local_ip));
+                report_current_state(&client, &cfg, state, metrics, host).await;
             }
             changed = state_rx.changed() => {
                 if changed.is_err() {
                     break;
                 }
                 let state = *state_rx.borrow_and_update();
-                report_current_state(&client, &cfg, state).await;
+                let metrics = tunnel_metrics.read().ok().and_then(|value| *value);
+                let host = host_collector.sample(metrics.map(|sample| sample.local_ip));
+                report_current_state(&client, &cfg, state, metrics, host).await;
             }
         }
     }
 }
 
-async fn report_current_state(client: &Client, cfg: &ReporterConfig, state: ConnectionState) {
-    if let Err(err) = send_device_state(client, cfg, state).await {
+async fn report_current_state(
+    client: &Client,
+    cfg: &ReporterConfig,
+    state: ConnectionState,
+    metrics: Option<TunnelMetrics>,
+    host: HostSnapshot,
+) {
+    if let Err(err) = send_device_state(client, cfg, state, metrics, host).await {
         // Device monitoring must never become a tunnel liveness dependency.
         tracing::warn!("failed to report Cloudflare device state: {err:#}");
     }
@@ -169,8 +289,10 @@ async fn send_device_state(
     client: &Client,
     cfg: &ReporterConfig,
     state: ConnectionState,
+    metrics: Option<TunnelMetrics>,
+    host: HostSnapshot,
 ) -> Result<()> {
-    let payload = build_payload(cfg, state);
+    let payload = build_payload(cfg, state, metrics, host);
     let url = format!(
         "{}/{}/accounts/{}/reg/{}/devicestate",
         internal::api_url(),
@@ -202,18 +324,61 @@ async fn send_device_state(
         status = payload.status,
         mode = payload.mode,
         tunnel_type = payload.tunnel_type,
+        interface = payload.interfaces.first().map(|value| value.name.as_str()).unwrap_or("none"),
+        network_sent_bps = ?payload.interfaces.first().and_then(|value| value.network_sent_bps),
+        network_rcvd_bps = ?payload.interfaces.first().and_then(|value| value.network_rcvd_bps),
+        cpu_pct = ?payload.cpu_pct,
+        ram_used_pct = ?payload.ram_used_pct,
+        rtt_us = ?payload.tunnel_stats_upstream.as_ref().map(|value| value.rtt_us),
         "reported Cloudflare device state"
     );
     Ok(())
 }
 
-fn build_payload(cfg: &ReporterConfig, state: ConnectionState) -> DeviceStatePayload<'_> {
-    let (status, handshake_latency_ms, estimated_loss) = match state {
-        ConnectionState::Disconnected => ("Disconnected", None, None),
+fn build_payload(
+    cfg: &ReporterConfig,
+    state: ConnectionState,
+    metrics: Option<TunnelMetrics>,
+    host: HostSnapshot,
+) -> DeviceStatePayload<'_> {
+    let (status, handshake_latency_ms) = match state {
+        ConnectionState::Disconnected => ("Disconnected", None),
         ConnectionState::Connected {
             handshake_latency_ms,
-        } => ("Connected", Some(handshake_latency_ms), Some(0.0)),
+        } => (
+            "Connected",
+            Some(metrics.map_or(handshake_latency_ms, |sample| sample.rtt_us / 1_000)),
+        ),
     };
+    let connected_metrics = (status == "Connected").then_some(metrics).flatten();
+    let estimated_loss = connected_metrics.and_then(|sample| {
+        (sample.packets_sent_upstream > 0)
+            .then(|| sample.packets_lost_upstream as f64 / sample.packets_sent_upstream as f64)
+    });
+    let tunnel_stats_upstream = connected_metrics.map(|sample| TunnelStatsPayload {
+        rtt_us: sample.rtt_us,
+        min_rtt_us: sample.min_rtt_us,
+        rtt_var_us: sample.rtt_var_us,
+        packets_sent: sample.packets_sent_upstream,
+        packets_lost: Some(sample.packets_lost_upstream),
+        packets_retransmitted: Some(sample.packets_retransmitted_upstream),
+        bytes_sent: sample.bytes_sent_upstream,
+        bytes_lost: Some(sample.bytes_lost_upstream),
+        bytes_retransmitted: Some(sample.bytes_retransmitted_upstream),
+    });
+    let tunnel_stats_downstream = connected_metrics.map(|sample| TunnelStatsPayload {
+        // QUIC RTT is a property of the bidirectional path, so the same
+        // measured values legitimately describe both directional views.
+        rtt_us: sample.rtt_us,
+        min_rtt_us: sample.min_rtt_us,
+        rtt_var_us: sample.rtt_var_us,
+        packets_sent: sample.packets_received_downstream,
+        packets_lost: None,
+        packets_retransmitted: None,
+        bytes_sent: sample.bytes_received_downstream,
+        bytes_lost: None,
+        bytes_retransmitted: None,
+    });
 
     DeviceStatePayload {
         timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
@@ -231,19 +396,22 @@ fn build_payload(cfg: &ReporterConfig, state: ConnectionState) -> DeviceStatePay
         handshake_latency_ms,
         estimated_loss,
         tunnel_type: "masque",
-        interfaces: Vec::new(),
+        interfaces: host
+            .interface
+            .into_iter()
+            .map(InterfaceInfo::from)
+            .collect(),
         firewalls: BTreeMap::new(),
-        // These fields are part of Cloudflare's current base device-state
-        // contract. Hardware telemetry collection is intentionally deferred;
-        // zero means no sample has been collected by this tunnel-only port.
-        cpu_pct: 0.0,
-        cpu_pct_by_app: Vec::new(),
-        ram_used_pct: 0.0,
-        ram_used_pct_by_app: Vec::new(),
-        ram_available_kb: 0,
-        disk_usage_pct: 0.0,
-        disk_read_bps: 0,
-        disk_write_bps: 0,
+        cpu_pct: host.cpu_pct,
+        cpu_pct_by_app: None,
+        ram_used_pct: host.ram_used_pct,
+        tunnel_stats_upstream,
+        tunnel_stats_downstream,
+        ram_used_pct_by_app: None,
+        ram_available_kb: host.ram_available_kb,
+        disk_usage_pct: host.disk_usage_pct,
+        disk_read_bps: None,
+        disk_write_bps: None,
         profile_id: &cfg.profile_id,
     }
 }
@@ -289,6 +457,8 @@ mod tests {
             ConnectionState::Connected {
                 handshake_latency_ms: 42,
             },
+            None,
+            HostSnapshot::default(),
         ))
         .unwrap();
 
@@ -299,5 +469,50 @@ mod tests {
         assert_eq!(value["handshake_latency_ms"], 42);
         assert!(value.get("system_info").is_none());
         assert!(value["firewalls"].is_object());
+        assert!(value.get("cpu_pct").is_none());
+        assert!(value.get("ram_used_pct").is_none());
+        assert!(value.get("disk_read_bps").is_none());
+        assert!(value["estimated_loss"].is_null());
+        assert!(value.get("tunnel_stats_upstream").is_none());
+    }
+
+    #[test]
+    fn payload_maps_observed_quiche_path_metrics_without_inventing_downstream_loss() {
+        let cfg = test_config();
+        let metrics = TunnelMetrics {
+            local_ip: "192.0.2.10".parse().unwrap(),
+            rtt_us: 16_000,
+            min_rtt_us: Some(12_000),
+            rtt_var_us: 1_500,
+            packets_sent_upstream: 100,
+            packets_received_downstream: 200,
+            packets_lost_upstream: 2,
+            packets_retransmitted_upstream: 1,
+            bytes_sent_upstream: 10_000,
+            bytes_received_downstream: 20_000,
+            bytes_lost_upstream: 240,
+            bytes_retransmitted_upstream: 120,
+        };
+        let value = serde_json::to_value(build_payload(
+            &cfg,
+            ConnectionState::Connected {
+                handshake_latency_ms: 42,
+            },
+            Some(metrics),
+            HostSnapshot::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(value["handshake_latency_ms"], 16);
+        assert_eq!(value["estimated_loss"], 0.02);
+        assert_eq!(value["tunnel_stats_upstream"]["rtt_us"], 16_000);
+        assert_eq!(value["tunnel_stats_upstream"]["packets_lost"], 2);
+        assert_eq!(value["tunnel_stats_upstream"]["bytes_retransmitted"], 120);
+        assert_eq!(value["tunnel_stats_downstream"]["packets_sent"], 200);
+        assert_eq!(value["tunnel_stats_downstream"]["bytes_sent"], 20_000);
+        assert!(value["tunnel_stats_downstream"]
+            .get("packets_lost")
+            .is_none());
+        assert!(value["tunnel_stats_downstream"].get("bytes_lost").is_none());
     }
 }

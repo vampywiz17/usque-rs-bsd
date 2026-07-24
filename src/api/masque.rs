@@ -6,7 +6,7 @@ mod timing;
 mod udp;
 pub use supervisor::maintain_native_tun;
 
-use crate::api::device_state::DeviceStateReporter;
+use crate::api::device_state::{DeviceStateReporter, TunnelMetrics};
 use crate::api::hooks::run_hook;
 use crate::api::{icmp, packet};
 use crate::config::MasqueEndpoint;
@@ -322,6 +322,7 @@ async fn run_tunnel_session(
         &flow_prefix,
         flow_id,
         &stats,
+        cfg.device_state.as_ref(),
         cfg.quic.keepalive_period,
         cfg.path_mtu.enabled,
         cfg.path_mtu.revalidate_period,
@@ -358,6 +359,7 @@ async fn data_loop(
     flow_prefix: &[u8],
     flow_id: u64,
     stats: &Arc<Stats>,
+    device_state: Option<&DeviceStateReporter>,
     keepalive_period: Duration,
     enable_pmtud: bool,
     pmtud_revalidate_period: Duration,
@@ -429,6 +431,7 @@ async fn data_loop(
     let result: Result<()> = async {
         let mut tx_queue: VecDeque<TxDatagram> = VecDeque::with_capacity(tx_queue_len.min(65_536));
         let mut tun_reader_closed = false;
+        let mut last_telemetry_sample = Instant::now() - Duration::from_secs(1);
         // Drive keepalive from a periodic outbound deadline, not from received
         // packets. Incoming traffic does not reliably refresh UDP/NAT state in
         // the client-to-server direction, so postponing PING after a receive can
@@ -518,6 +521,11 @@ async fn data_loop(
             // If we still have queued DATAGRAMs and quiche accepted a full burst,
             // continue immediately. This batches upload traffic without the naive
             // per-packet sleep that hurt throughput in the pacing build.
+            if last_telemetry_sample.elapsed() >= Duration::from_secs(1) {
+                publish_tunnel_metrics(conn, device_state);
+                last_telemetry_sample = Instant::now();
+            }
+
             if !tx_queue.is_empty() && progress.queued >= tx_burst_packets && !progress.backpressure {
                 continue;
             }
@@ -596,6 +604,32 @@ async fn data_loop(
 
     tun_reader.abort();
     result
+}
+
+fn publish_tunnel_metrics(conn: &quiche::Connection, reporter: Option<&DeviceStateReporter>) {
+    let Some(reporter) = reporter else {
+        return;
+    };
+    let Some(path) = conn.path_stats().find(|path| path.active) else {
+        return;
+    };
+    let micros = |duration: Duration| duration.as_micros().min(u128::from(u64::MAX)) as u64;
+    let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+
+    reporter.update_tunnel_metrics(TunnelMetrics {
+        local_ip: path.local_addr.ip(),
+        rtt_us: micros(path.rtt),
+        min_rtt_us: path.min_rtt.map(micros),
+        rtt_var_us: micros(path.rttvar),
+        packets_sent_upstream: count(path.sent),
+        packets_received_downstream: count(path.recv),
+        packets_lost_upstream: count(path.lost),
+        packets_retransmitted_upstream: count(path.retrans),
+        bytes_sent_upstream: path.sent_bytes,
+        bytes_received_downstream: path.recv_bytes,
+        bytes_lost_upstream: path.lost_bytes,
+        bytes_retransmitted_upstream: path.stream_retrans_bytes,
+    });
 }
 
 async fn build_tx_datagram(

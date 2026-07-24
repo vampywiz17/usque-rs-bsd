@@ -35,7 +35,7 @@ bug fix that is not present upstream.
 | QUIC stack | `quiche` 0.22 with fixed 1350-byte UDP payloads | Pinned `quiche` 0.29.3 with RFC 8899 DPLPMTUD |
 | TUN MTU | Fixed at 1280 | Starts conservatively and follows quiche's writable DATAGRAM capacity up to the configured ceiling |
 | Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment and truthful FreeBSD metadata |
-| Device monitoring | No Cloudflare device-state integration | Out-of-tunnel HTTPS orchestration heartbeat tied to the real MASQUE session lifecycle (`Connected`/`Disconnected`, `tunnel_only`, `masque`) |
+| Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
@@ -105,10 +105,17 @@ update on connect/disconnect and a 60-second heartbeat while running, using
 Cloudflare One Client device-state contract. Reporting failures are logged but
 never terminate or reconnect the QUIC tunnel.
 
-This first implementation intentionally covers connection health, mode, tunnel
-type, profile and handshake latency only. Hardware and per-interface telemetry
-collectors are not implemented yet; the reporter does not invent Wi-Fi,
-battery, application or interface data.
+Each heartbeat reports cumulative packet, byte, loss, retransmission and RTT
+statistics directly from quiche's active QUIC path. Native FreeBSD collectors use
+`getifaddrs`, interface counters, `sysctl` and `statvfs` to report the active
+interface type and addresses, network throughput, CPU and memory utilization,
+available memory and root-filesystem usage. Cloudflare percentage fields retain
+the contract's 0-to-1 scale and network rates are bytes per second.
+
+Metrics that cannot be measured truthfully with a supported FreeBSD or quiche API
+are omitted rather than sent as zero. This currently includes peer-side
+downstream loss/retransmission, public ISP and gateway addresses, Wi-Fi and
+battery data, per-application resource usage and disk I/O rates.
 
 ## FreeBSD-tuned defaults
 
