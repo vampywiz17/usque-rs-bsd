@@ -12,12 +12,40 @@ The project provides a native TUN tunnel for Cloudflare WARP's MASQUE/CONNECT-IP
 - Native TUN mode only
 - FreeBSD as the primary target
 - Cloudflare registration and MASQUE key enrollment
+- Stable FreeBSD device identity and MASQUE-native registration metadata
 - QUIC/HTTP/3 MASQUE `cf-connect-ip` tunnel
+- RFC 8899 DPLPMTUD with dynamic native TUN MTU updates
 - IPv4 and IPv6 packet handling
 - Reconnect and connect/disconnect hooks
 - FreeBSD-oriented upload tuning
 
 Proxy modes, port forwarding and HTTP/2 fallback are currently out of scope. See [the port status](docs/PORT_STATUS.md) for details.
+
+## Differences from upstream `usque-rs`
+
+This section is the maintained record of intentional differences from
+[Diniboy1123/usque-rs](https://github.com/Diniboy1123/usque-rs). It must be
+updated whenever this port gains a feature, compatibility change or material
+bug fix that is not present upstream.
+
+| Area | Upstream implementation | This FreeBSD port |
+| --- | --- | --- |
+| Platform and TUN backend | Linux-only `tun` plus `rtnetlink` | Native FreeBSD support through the public `tun-rs` API |
+| QUIC stack | `quiche` 0.22 with fixed 1350-byte UDP payloads | Pinned `quiche` 0.29.3 with RFC 8899 DPLPMTUD |
+| TUN MTU | Fixed at 1280 | Starts conservatively and follows quiche's writable DATAGRAM capacity up to the configured ceiling |
+| Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment and truthful FreeBSD metadata |
+| Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
+| Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
+| Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
+| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks |
+| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, socket-buffer tuning and configurable congestion control/initial CWND |
+| Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
+
+The project deliberately remains tunnel-only. It does not take ownership of
+routes, DNS, firewall policy, proxying or split-tunnel rules; those belong to
+the FreeBSD host and, in the intended deployment, OPNsense. Compatibility work
+aims to use standards-compliant Cloudflare, quiche and `tun-rs` behavior with
+truthful metadata, not to impersonate another operating system or client.
 
 ## FreeBSD build
 
@@ -72,8 +100,11 @@ The application configures interface addresses and MTU, but does not manage the 
 | --- | ---: | --- |
 | `--connect-port` | `0` | Uses Cloudflare's API-provided endpoint ports; legacy configs fall back to `443`. A non-zero value overrides every endpoint port |
 | `--ipv6` | off | Prefers an IPv6 MASQUE endpoint while retaining IPv4 as fallback |
-| `--mtu` | `1200` | Reduced loss and jitter on the tested MASQUE path |
-| `--initial-packet-size` | `1250` | Leaves room for QUIC/MASQUE overhead |
+| `--mtu` | `1200` | Safe initial TUN MTU used while PMTUD is running |
+| `--max-tun-mtu` | `1280` | Native-compatible inner IP MTU ceiling; may be overridden for experiments |
+| `--initial-packet-size` | `1472` | Maximum QUIC UDP payload probed by DPLPMTUD |
+| `--pmtud-max-probes` | `3` | RFC 8899 probe failure threshold |
+| `--pmtud-revalidate-period` | `10m` | Rechecks a completed PMTU; `0s` disables periodic revalidation |
 | `--initial-cwnd-packets` | `32` | Faster startup without the latency penalty seen at larger packet sizes |
 | `--tx-queue-len` | `8192` | Decouples the TUN reader from QUIC pacing |
 | `--tx-burst-packets` | `16` | Keeps upload latency low without reducing measured throughput |
@@ -104,7 +135,19 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
 
 ## Implementation notes
 
-- `quiche` is pinned to `0.29.2` with the `gcongestion` feature.
+- `quiche` is pinned to `0.29.3` with the `gcongestion` feature. PMTUD uses
+  `Config::discover_pmtu`, `Connection::pmtu` and
+  `Connection::revalidate_pmtu`. The TUN MTU is derived from quiche's actual
+  writable DATAGRAM capacity and applied through `tun-rs::set_mtu`; no
+  private QUIC or platform-specific MTU probing is used.
+- New registrations use a P-256/SPKI key and MASQUE metadata from the first
+  API request. Device name, FreeBSD version, model and a privacy-preserving
+  stable serial are persisted in `config.json`. The serial is a SHA-256
+  digest prefix of the system UUID or host ID, not the raw hardware value.
+- The default orchestration SNI is `api.devices.cloudflare.com`, used by
+  Cloudflare One Client 2026.6 and later. The compatible registration path
+  remains configurable with `USQUE_API_URL` and `USQUE_API_VERSION` because
+  Cloudflare does not publish the client-side registration wire API.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.

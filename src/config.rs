@@ -1,3 +1,4 @@
+use crate::models::DeviceIdentity;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use p256::SecretKey;
@@ -20,6 +21,10 @@ pub struct AppConfig {
     pub access_token: String,
     pub ipv4: String,
     pub ipv6: String,
+    /// Stable, truthful metadata used for Cloudflare device registration.
+    /// Older configurations are upgraded when `enroll` is run.
+    #[serde(default)]
+    pub device_identity: DeviceIdentity,
     /// Full MASQUE peer list returned by the Cloudflare registration API.
     /// Legacy configurations without this field continue to use the fields
     /// above.
@@ -43,7 +48,8 @@ pub struct MasquePeerConfig {
 
 impl AppConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let raw = fs::read_to_string(path).with_context(|| format!("failed to open config file {path}"))?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to open config file {path}"))?;
         serde_json::from_str(&raw).with_context(|| format!("failed to decode config file {path}"))
     }
 
@@ -58,7 +64,6 @@ impl AppConfig {
             .context("failed to decode base64 private key")?;
         SecretKey::from_sec1_der(&der).context("failed to parse P-256 SEC1 private key")
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +83,9 @@ pub struct MasqueEndpoint {
 }
 
 pub fn warn_insecure() {
-    tracing::warn!("--insecure is set, endpoint certificate pinning is disabled. Do not use in production!");
+    tracing::warn!(
+        "--insecure is set, endpoint certificate pinning is disabled. Do not use in production!"
+    );
 }
 
 /// Builds the ordered MASQUE endpoint list without taking over DNS, routing,
@@ -114,8 +121,12 @@ pub fn select_endpoints_from_config(
         let ports: Vec<u16> = if port_override != 0 {
             vec![port_override]
         } else {
-            let api_ports: Vec<u16> =
-                peer.ports.iter().copied().filter(|port| *port != 0).collect();
+            let api_ports: Vec<u16> = peer
+                .ports
+                .iter()
+                .copied()
+                .filter(|port| *port != 0)
+                .collect();
             if api_ports.is_empty() {
                 vec![443]
             } else {
@@ -124,15 +135,9 @@ pub fn select_endpoints_from_config(
         };
 
         let families = if prefer_ipv6 {
-            [
-                peer.endpoint_v6.as_str(),
-                peer.endpoint_v4.as_str(),
-            ]
+            [peer.endpoint_v6.as_str(), peer.endpoint_v4.as_str()]
         } else {
-            [
-                peer.endpoint_v4.as_str(),
-                peer.endpoint_v6.as_str(),
-            ]
+            [peer.endpoint_v4.as_str(), peer.endpoint_v6.as_str()]
         };
 
         for address in families {
@@ -209,8 +214,7 @@ mod tests {
         };
 
         let endpoints = select_endpoints_from_config(&cfg, true, 0).unwrap();
-        let addresses: Vec<SocketAddr> =
-            endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
+        let addresses: Vec<SocketAddr> = endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
         assert_eq!(
             addresses,
             vec![
@@ -232,8 +236,7 @@ mod tests {
         };
 
         let endpoints = select_endpoints_from_config(&cfg, false, 4443).unwrap();
-        let addresses: Vec<SocketAddr> =
-            endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
+        let addresses: Vec<SocketAddr> = endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
         assert_eq!(
             addresses,
             vec![
@@ -264,8 +267,7 @@ mod tests {
         };
 
         let endpoints = select_endpoints_from_config(&cfg, false, 0).unwrap();
-        let addresses: Vec<SocketAddr> =
-            endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
+        let addresses: Vec<SocketAddr> = endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
         assert_eq!(
             addresses,
             vec![

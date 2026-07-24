@@ -3,7 +3,7 @@ use crate::api::masque::{maintain_native_tun, MasqueConfig};
 use crate::api::tunnel::TunnelDevice;
 use crate::config::{self, AppConfig};
 use crate::internal;
-use crate::models::{AccountData, INVALID_PUBLIC_KEY};
+use crate::models::{AccountData, DeviceIdentity, INVALID_PUBLIC_KEY};
 use crate::native_tun::{TunOptions, TunRsDevice};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -80,11 +80,28 @@ pub struct NativeTunArgs {
     /// Use 0s to disable keepalive.
     #[arg(short = 'k', long, default_value = "25s", value_parser = parse_duration)]
     pub keepalive_period: Duration,
+    /// Safe MTU used while PMTUD is running. The interface is raised to the
+    /// discovered MASQUE DATAGRAM capacity, up to --max-tun-mtu.
     #[arg(short = 'm', long, default_value_t = 1200)]
     pub mtu: u16,
-    /// Maximum UDP payload size for QUIC packets. Default 1250 was selected from FreeBSD upload tests for lower loss/jitter.
-    #[arg(long, default_value_t = 1250)]
+    /// Upper bound for the dynamically discovered TUN MTU. Cloudflare's
+    /// documented MASQUE thresholds are based on a 1280-byte inner packet.
+    #[arg(long, default_value_t = 1280)]
+    pub max_tun_mtu: u16,
+    /// Maximum UDP payload PMTUD may probe. 1472 reaches a 1500-byte IPv4 path;
+    /// quiche automatically discovers a lower value for IPv6 or smaller paths.
+    #[arg(long, default_value_t = 1472)]
     pub initial_packet_size: u16,
+    /// Disable RFC 8899 DPLPMTUD and keep the TUN interface at --mtu.
+    #[arg(long)]
+    pub disable_pmtud: bool,
+    /// Failed probes required before quiche reduces a candidate PMTU.
+    #[arg(long, default_value_t = 3)]
+    pub pmtud_max_probes: u8,
+    /// Periodically revalidate the discovered PMTU. Use 0s to disable
+    /// revalidation while retaining initial discovery.
+    #[arg(long, default_value = "10m", value_parser = parse_duration)]
+    pub pmtud_revalidate_period: Duration,
     /// QUIC congestion-control algorithm. Try: cubic, reno, bbr2_gcongestion.
     #[arg(long, default_value = "cubic")]
     pub cc: String,
@@ -160,31 +177,47 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
     if Path::new(config_path).exists() {
         println!("You already have a config. Do you want to overwrite it? (y/n) ");
         let mut response = String::new();
-        std::io::stdin().read_line(&mut response).context("failed to read response")?;
+        std::io::stdin()
+            .read_line(&mut response)
+            .context("failed to read response")?;
         if response.trim() != "y" {
             return Ok(());
         }
     }
 
+    let identity = internal::detect_device_identity(&args.name, &args.model, &args.locale);
     if args.jwt.is_empty() {
-        tracing::info!("Registering with locale {} and model {}", args.locale, args.model);
+        tracing::info!(
+            "Registering MASQUE device '{}' ({} {}, client {})",
+            identity.name,
+            identity.device_type,
+            identity.os_version,
+            identity.client_version
+        );
     } else {
-        tracing::info!("Registering with locale {} and model {} using jwt authentication", args.locale, args.model);
+        tracing::info!(
+            "Registering MASQUE device '{}' using JWT authentication",
+            identity.name
+        );
     }
 
+    let (private_key_der, public_key_der) = internal::generate_ec_key_pair()?;
     let account = cloudflare::register(
-        &args.model,
-        &args.locale,
-        if args.jwt.is_empty() { None } else { Some(args.jwt.as_str()) },
+        &identity,
+        &public_key_der,
+        if args.jwt.is_empty() {
+            None
+        } else {
+            Some(args.jwt.as_str())
+        },
         args.accept_tos,
     )
     .await?;
 
-    let (private_key_der, public_key_der) = internal::generate_ec_key_pair()?;
     tracing::info!("Enrolling device key...");
-    let updated = enroll_or_fail(&account, &public_key_der, args.name.as_str()).await?;
+    let updated = enroll_or_fail(&account, &public_key_der, &identity).await?;
 
-    let app_cfg = build_app_config(&updated, &private_key_der, &account.token)?;
+    let app_cfg = build_app_config(&updated, &private_key_der, &account.token, identity)?;
     app_cfg.save(config_path)?;
     tracing::info!("Config saved to {config_path}");
     Ok(())
@@ -192,7 +225,24 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
 
 async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
     let mut cfg = AppConfig::load(config_path)?;
-    let account = AccountData { id: cfg.id.clone(), token: cfg.access_token.clone(), ..Default::default() };
+    let account = AccountData {
+        id: cfg.id.clone(),
+        token: cfg.access_token.clone(),
+        ..Default::default()
+    };
+    let mut identity = if cfg.device_identity.serial_number.is_empty() {
+        internal::detect_device_identity(
+            &args.name,
+            internal::DEFAULT_MODEL,
+            internal::DEFAULT_LOCALE,
+        )
+    } else {
+        cfg.device_identity.clone()
+    };
+    if !args.name.trim().is_empty() {
+        identity.name = args.name.trim().to_string();
+    }
+    identity.client_version = env!("CARGO_PKG_VERSION").to_string();
 
     let (mut private_key_der, mut public_key_der): (Vec<u8>, Vec<u8>) = if args.regen_key {
         tracing::info!("Regenerating key pair...");
@@ -205,25 +255,33 @@ async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
     };
 
     tracing::info!("Enrolling device key...");
-    let updated = match cloudflare::enroll_key(&account, &public_key_der, Some(args.name.as_str())).await {
+    let updated = match cloudflare::enroll_key(&account, &public_key_der, &identity).await {
         Ok(updated) => updated,
-        Err(EnrollFailure::Api { status: _, api_error }) if api_error.has_error_message(INVALID_PUBLIC_KEY) => {
+        Err(EnrollFailure::Api {
+            status: _,
+            api_error,
+        }) if api_error.has_error_message(INVALID_PUBLIC_KEY) => {
             println!("Invalid public key detected. Regenerate key? (y/n): ");
             let mut response = String::new();
-            std::io::stdin().read_line(&mut response).context("failed to read user input")?;
+            std::io::stdin()
+                .read_line(&mut response)
+                .context("failed to read user input")?;
             if response.trim() != "y" {
-                return Err(anyhow!("enrollment aborted by user. API errors: {}", api_error.errors_as_string("; ")));
+                return Err(anyhow!(
+                    "enrollment aborted by user. API errors: {}",
+                    api_error.errors_as_string("; ")
+                ));
             }
             tracing::info!("Regenerating key pair...");
             let pair = internal::generate_ec_key_pair()?;
             private_key_der = pair.0;
             public_key_der = pair.1;
-            enroll_or_fail(&account, &public_key_der, args.name.as_str()).await?
+            enroll_or_fail(&account, &public_key_der, &identity).await?
         }
         Err(err) => return Err(anyhow!(err)),
     };
 
-    cfg = build_app_config(&updated, &private_key_der, &account.token)?;
+    cfg = build_app_config(&updated, &private_key_der, &account.token, identity)?;
     cfg.save(config_path)?;
     tracing::info!("Config saved to {config_path}");
     Ok(())
@@ -234,8 +292,12 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
     if !args.interface_name.is_empty() {
         internal::check_ifname(&args.interface_name)?;
     }
-    if args.mtu != 1200 {
-        tracing::warn!("MTU is not the tuned FreeBSD default 1200 for this release. Packet loss and jitter may increase.");
+    if args.max_tun_mtu < args.mtu {
+        return Err(anyhow!(
+            "--max-tun-mtu ({}) must be at least --mtu ({})",
+            args.max_tun_mtu,
+            args.mtu
+        ));
     }
     if args.keepalive_period.is_zero() {
         tracing::info!("QUIC keepalive is disabled");
@@ -246,8 +308,7 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         );
     }
 
-    let endpoints =
-        config::select_endpoints_from_config(&cfg, args.ipv6, args.connect_port)?;
+    let endpoints = config::select_endpoints_from_config(&cfg, args.ipv6, args.connect_port)?;
     if args.insecure {
         config::warn_insecure();
     }
@@ -255,7 +316,11 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
     let tun = TunRsDevice::create(
         &cfg,
         TunOptions {
-            name: if args.interface_name.is_empty() { None } else { Some(args.interface_name.clone()) },
+            name: if args.interface_name.is_empty() {
+                None
+            } else {
+                Some(args.interface_name.clone())
+            },
             mtu: args.mtu,
             configure_addresses: !args.no_iproute2,
             ipv4: !args.no_tunnel_ipv4,
@@ -282,6 +347,19 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         endpoints,
         keepalive_period: args.keepalive_period,
         initial_packet_size: args.initial_packet_size,
+        enable_pmtud: !args.disable_pmtud,
+        pmtud_max_probes: args.pmtud_max_probes,
+        pmtud_revalidate_period: args.pmtud_revalidate_period,
+        initial_tun_mtu: args.mtu,
+        max_tun_mtu: args.max_tun_mtu,
+        user_agent: if cfg.device_identity.client_version.is_empty() {
+            internal::client_user_agent()
+        } else {
+            format!(
+                "usque-nativetun/{} (FreeBSD; TunnelOnly; MASQUE)",
+                cfg.device_identity.client_version
+            )
+        },
         cc_algorithm: args.cc,
         initial_cwnd_packets: args.initial_cwnd_packets,
         disable_quic_pacing: args.disable_quic_pacing,
@@ -301,16 +379,25 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
     };
 
     tracing::info!("Tunnel device is ready; starting MASQUE packet pump");
-    maintain_native_tun(&cfg, masque, tun, args.mtu as usize).await
+    maintain_native_tun(&cfg, masque, tun, args.max_tun_mtu as usize).await
 }
 
-async fn enroll_or_fail(account: &AccountData, public_key_der: &[u8], device_name: &str) -> Result<AccountData> {
-    cloudflare::enroll_key(account, public_key_der, Some(device_name))
+async fn enroll_or_fail(
+    account: &AccountData,
+    public_key_der: &[u8],
+    identity: &DeviceIdentity,
+) -> Result<AccountData> {
+    cloudflare::enroll_key(account, public_key_der, identity)
         .await
         .map_err(|err| anyhow!(err))
 }
 
-fn build_app_config(account: &AccountData, private_key_der: &[u8], access_token: &str) -> Result<AppConfig> {
+fn build_app_config(
+    account: &AccountData,
+    private_key_der: &[u8],
+    access_token: &str,
+    device_identity: DeviceIdentity,
+) -> Result<AppConfig> {
     let peer = account
         .config
         .peers
@@ -326,17 +413,14 @@ fn build_app_config(account: &AccountData, private_key_der: &[u8], access_token:
         access_token: access_token.to_string(),
         ipv4: account.config.interface.addresses.v4.clone(),
         ipv6: account.config.interface.addresses.v6.clone(),
+        device_identity,
         masque_peers: account
             .config
             .peers
             .iter()
             .map(|peer| config::MasquePeerConfig {
-                endpoint_v4: config::endpoint_v4_from_account_value(
-                    &peer.endpoint.v4,
-                ),
-                endpoint_v6: config::endpoint_v6_from_account_value(
-                    &peer.endpoint.v6,
-                ),
+                endpoint_v4: config::endpoint_v4_from_account_value(&peer.endpoint.v4),
+                endpoint_v6: config::endpoint_v6_from_account_value(&peer.endpoint.v6),
                 endpoint_host: peer.endpoint.host.clone(),
                 ports: peer.endpoint.ports.clone(),
                 endpoint_pub_key: peer.public_key.clone(),
@@ -346,18 +430,34 @@ fn build_app_config(account: &AccountData, private_key_der: &[u8], access_token:
 }
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
     if let Some(ms) = input.strip_suffix("ms") {
-        return ms.parse::<u64>().map(Duration::from_millis).map_err(|e| e.to_string());
+        return ms
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|e| e.to_string());
     }
     if let Some(s) = input.strip_suffix('s') {
-        return s.parse::<u64>().map(Duration::from_secs).map_err(|e| e.to_string());
+        return s
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| e.to_string());
     }
     if let Some(m) = input.strip_suffix('m') {
-        return m.parse::<u64>().map(|m| Duration::from_secs(m * 60)).map_err(|e| e.to_string());
+        return m
+            .parse::<u64>()
+            .map(|m| Duration::from_secs(m * 60))
+            .map_err(|e| e.to_string());
     }
-    input.parse::<u64>().map(Duration::from_secs).map_err(|e| e.to_string())
+    input
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|e| e.to_string())
 }

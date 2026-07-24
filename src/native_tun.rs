@@ -30,6 +30,16 @@ impl TunRsDevice {
         Ok(())
     }
 
+    pub fn mtu(&self) -> Result<u16> {
+        self.dev.mtu().context("tun-rs failed to read TUN MTU")
+    }
+
+    pub fn set_mtu(&self, mtu: u16) -> Result<()> {
+        self.dev
+            .set_mtu(mtu)
+            .with_context(|| format!("tun-rs failed to set TUN MTU to {mtu}"))
+    }
+
     pub async fn create(cfg: &AppConfig, opts: TunOptions) -> Result<Arc<Self>> {
         let mut builder = DeviceBuilder::new().mtu(opts.mtu);
 
@@ -46,7 +56,9 @@ impl TunRsDevice {
             }
         }
 
-        let dev = builder.build_async().context("failed to build tun-rs AsyncDevice")?;
+        let dev = builder
+            .build_async()
+            .context("failed to build tun-rs AsyncDevice")?;
 
         if opts.configure_addresses {
             // Linux exposes enabled(true) through tun-rs. On BSD/macOS/Windows,
@@ -54,7 +66,9 @@ impl TunRsDevice {
             // manual host-side ifconfig/netsh setup.
             #[cfg(target_os = "linux")]
             if let Err(err) = dev.enabled(true) {
-                tracing::warn!("failed to set interface up via tun-rs: {err}; configure it manually if needed");
+                tracing::warn!(
+                    "failed to set interface up via tun-rs: {err}; configure it manually if needed"
+                );
             }
         } else {
             tracing::info!("Skipping address/link setup. Configure the TUN interface manually.");
@@ -69,7 +83,9 @@ impl TunRsDevice {
             tracing::warn!("--persist is only supported on Linux by this port");
         }
 
-        let name = dev.name().unwrap_or_else(|_| opts.name.unwrap_or_else(|| "tun-rs".to_string()));
+        let name = dev
+            .name()
+            .unwrap_or_else(|_| opts.name.unwrap_or_else(|| "tun-rs".to_string()));
         Ok(Arc::new(Self { name, dev }))
     }
 }

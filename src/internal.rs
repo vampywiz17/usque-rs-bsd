@@ -1,37 +1,98 @@
+use crate::models::DeviceIdentity;
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
 use p256::pkcs8::EncodePublicKey;
 use p256::SecretKey;
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
+use ring::digest::{digest, SHA256};
+use std::fs;
+use std::process::Command;
 
-pub const API_URL: &str = "https://api.cloudflareclient.com";
+/// Cloudflare One Client 2026.6 and later uses this orchestration SNI.
+/// The registration path is the latest compatible public-client contract
+/// known to this project; Cloudflare does not publish that private wire API.
+pub const API_URL: &str = "https://api.devices.cloudflare.com";
 pub const API_VERSION: &str = "v0a4471";
 pub const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
-pub const DEFAULT_MODEL: &str = "PC";
-pub const KEY_TYPE_WG: &str = "curve25519";
-pub const TUN_TYPE_WG: &str = "wireguard";
+pub const DEFAULT_MODEL: &str = "FreeBSD";
 pub const KEY_TYPE_MASQUE: &str = "secp256r1";
 pub const TUN_TYPE_MASQUE: &str = "masque";
 pub const DEFAULT_LOCALE: &str = "en_US";
 
-pub const DEFAULT_HEADERS: &[(&str, &str)] = &[
-    ("User-Agent", "WARP for Android"),
-    ("CF-Client-Version", "a-6.35-4471"),
-    ("Content-Type", "application/json; charset=UTF-8"),
-    ("Connection", "Keep-Alive"),
-];
-
-pub fn generate_random_android_serial() -> String {
-    let mut serial = [0u8; 8];
-    OsRng.fill_bytes(&mut serial);
-    hex::encode(serial)
+pub fn api_url() -> String {
+    std::env::var("USQUE_API_URL").unwrap_or_else(|_| API_URL.to_string())
 }
 
-pub fn generate_random_wg_pubkey() -> String {
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    general_purpose::STANDARD.encode(key)
+pub fn api_version() -> String {
+    std::env::var("USQUE_API_VERSION").unwrap_or_else(|_| API_VERSION.to_string())
+}
+
+pub fn client_user_agent() -> String {
+    format!(
+        "usque-nativetun/{} (FreeBSD; TunnelOnly; MASQUE)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+pub fn detect_device_identity(
+    requested_name: &str,
+    requested_model: &str,
+    locale: &str,
+) -> DeviceIdentity {
+    let name = non_empty(requested_name).unwrap_or_else(detect_hostname);
+    let os_version = detect_os_version();
+    let stable_source = detect_hardware_source().unwrap_or_else(|| format!("{name}\0{os_version}"));
+    let serial_digest = digest(&SHA256, stable_source.as_bytes());
+    let serial_number = hex::encode(&serial_digest.as_ref()[..16]);
+
+    DeviceIdentity {
+        name,
+        device_type: "FreeBSD".to_string(),
+        manufacturer: "FreeBSD Project".to_string(),
+        model: non_empty(requested_model).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        os_version,
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        serial_number,
+        locale: non_empty(locale).unwrap_or_else(|| DEFAULT_LOCALE.to_string()),
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    non_empty(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn detect_hostname() -> String {
+    command_output("hostname", &[])
+        .or_else(|| std::env::var("HOSTNAME").ok().and_then(|v| non_empty(&v)))
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .and_then(|v| non_empty(&v))
+        })
+        .unwrap_or_else(|| "freebsd-device".to_string())
+}
+
+fn detect_os_version() -> String {
+    command_output("freebsd-version", &["-u"])
+        .or_else(|| command_output("uname", &["-K"]))
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
+fn detect_hardware_source() -> Option<String> {
+    command_output("kenv", &["-q", "smbios.system.uuid"]).or_else(|| {
+        fs::read_to_string("/etc/hostid")
+            .ok()
+            .and_then(|v| non_empty(&v))
+    })
 }
 
 pub fn time_as_cf_string_now() -> String {
@@ -64,7 +125,9 @@ pub fn check_ifname(name: &str) -> Result<()> {
         tracing::warn!("interface name contains non-ASCII character");
     }
     if name.chars().any(|c| c == '/' || c.is_whitespace()) {
-        return Err(anyhow!("interface name contains invalid character: '/' or whitespace"));
+        return Err(anyhow!(
+            "interface name contains invalid character: '/' or whitespace"
+        ));
     }
     Ok(())
 }

@@ -2,6 +2,18 @@ use serde::{Deserialize, Serialize};
 
 pub const INVALID_PUBLIC_KEY: &str = "Invalid public key";
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    pub name: String,
+    pub device_type: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub os_version: String,
+    pub client_version: String,
+    pub serial_number: String,
+    pub locale: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Registration {
     pub key: String,
@@ -14,6 +26,10 @@ pub struct Registration {
     pub key_type: String,
     pub tunnel_type: String,
     pub locale: String,
+    #[serde(rename = "type")]
+    pub device_type: String,
+    pub name: String,
+    pub manufacturer: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -23,6 +39,13 @@ pub struct DeviceUpdate {
     pub tunnel_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    pub model: String,
+    pub serial_number: String,
+    pub os_version: String,
+    pub locale: String,
+    #[serde(rename = "type")]
+    pub device_type: String,
+    pub manufacturer: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

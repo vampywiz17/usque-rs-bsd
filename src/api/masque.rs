@@ -10,9 +10,9 @@ use portable_atomic::{AtomicU64, Ordering};
 use quiche::h3::NameValue;
 use rcgen::{CertificateParams, KeyPair};
 use ring::rand::SecureRandom;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
 #[cfg(target_os = "freebsd")]
 use std::os::fd::AsRawFd;
@@ -22,7 +22,6 @@ use tempfile::NamedTempFile;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 const MIN_MTU: u16 = 1280;
-const DEFAULT_UDP_SOCKET_BUFFER: usize = 8 * 1024 * 1024;
 const DGRAM_QUEUE_LEN: usize = 16_384;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
 const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
@@ -36,6 +35,12 @@ pub struct MasqueConfig {
     pub endpoints: Vec<MasqueEndpoint>,
     pub keepalive_period: Duration,
     pub initial_packet_size: u16,
+    pub enable_pmtud: bool,
+    pub pmtud_max_probes: u8,
+    pub pmtud_revalidate_period: Duration,
+    pub initial_tun_mtu: u16,
+    pub max_tun_mtu: u16,
+    pub user_agent: String,
     pub cc_algorithm: String,
     pub initial_cwnd_packets: usize,
     pub disable_quic_pacing: bool,
@@ -112,14 +117,10 @@ impl UdpBatchIo {
         let batch_size = requested_batch_size.clamp(1, MAX_UDP_BATCH_SIZE);
         let datagram_size = datagram_size.max(MAX_DATAGRAM_SIZE);
         Self {
-            tx_buffers: (0..batch_size)
-                .map(|_| vec![0u8; datagram_size])
-                .collect(),
+            tx_buffers: (0..batch_size).map(|_| vec![0u8; datagram_size]).collect(),
             tx_lens: vec![0; batch_size],
             tx_at: vec![Instant::now(); batch_size],
-            rx_buffers: (0..batch_size)
-                .map(|_| vec![0u8; datagram_size])
-                .collect(),
+            rx_buffers: (0..batch_size).map(|_| vec![0u8; datagram_size]).collect(),
             batch_size,
         }
     }
@@ -201,11 +202,7 @@ impl UdpBatchIo {
                 // readiness state. Otherwise EAGAIN can leave a stale writable
                 // notification behind and spin one CPU core under backpressure.
                 match socket.try_io(tokio::io::Interest::WRITABLE, || {
-                    sendmmsg_nonblocking(
-                        fd,
-                        &self.tx_buffers[sent..end],
-                        &self.tx_lens[sent..end],
-                    )
+                    sendmmsg_nonblocking(fd, &self.tx_buffers[sent..end], &self.tx_lens[sent..end])
                 }) {
                     Ok(0) => {
                         socket.writable().await?;
@@ -255,9 +252,7 @@ impl UdpBatchIo {
                     to: local_addr,
                     from: endpoint,
                 };
-                if let Err(err) =
-                    conn.recv(&mut self.rx_buffers[index][..len], recv_info)
-                {
+                if let Err(err) = conn.recv(&mut self.rx_buffers[index][..len], recv_info) {
                     tracing::debug!("QUIC recv error while draining UDP batch: {err}");
                 }
             }
@@ -268,10 +263,7 @@ impl UdpBatchIo {
         }
     }
 
-    fn try_recv_batch(
-        &mut self,
-        socket: &tokio::net::UdpSocket,
-    ) -> std::io::Result<usize> {
+    fn try_recv_batch(&mut self, socket: &tokio::net::UdpSocket) -> std::io::Result<usize> {
         #[cfg(target_os = "freebsd")]
         {
             // recvmmsg() operates on the raw descriptor, so it must run through
@@ -279,11 +271,7 @@ impl UdpBatchIo {
             // clear a stale readable notification. Converting it to Ok(0)
             // earlier leaves the socket readable forever and causes a busy loop.
             return match socket.try_io(tokio::io::Interest::READABLE, || {
-                recvmmsg_nonblocking(
-                    socket.as_raw_fd(),
-                    &mut self.rx_buffers,
-                    &mut self.tx_lens,
-                )
+                recvmmsg_nonblocking(socket.as_raw_fd(), &mut self.rx_buffers, &mut self.tx_lens)
             }) {
                 Ok(count) => Ok(count),
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
@@ -318,11 +306,10 @@ fn sendmmsg_nonblocking(
     lengths: &[usize],
 ) -> std::io::Result<usize> {
     let count = buffers.len().min(lengths.len()).min(MAX_UDP_BATCH_SIZE);
-    let mut iovecs: [libc::iovec; MAX_UDP_BATCH_SIZE] =
-        std::array::from_fn(|_| libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        });
+    let mut iovecs: [libc::iovec; MAX_UDP_BATCH_SIZE] = std::array::from_fn(|_| libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    });
     let mut messages: [libc::mmsghdr; MAX_UDP_BATCH_SIZE] =
         std::array::from_fn(|_| unsafe { std::mem::zeroed() });
 
@@ -333,14 +320,8 @@ fn sendmmsg_nonblocking(
         messages[index].msg_hdr.msg_iovlen = 1;
     }
 
-    let result = unsafe {
-        libc::sendmmsg(
-            fd,
-            messages.as_mut_ptr(),
-            count as _,
-            libc::MSG_DONTWAIT,
-        )
-    };
+    let result =
+        unsafe { libc::sendmmsg(fd, messages.as_mut_ptr(), count as _, libc::MSG_DONTWAIT) };
     if result < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -355,17 +336,15 @@ fn recvmmsg_nonblocking(
     lengths: &mut [usize],
 ) -> std::io::Result<usize> {
     let count = buffers.len().min(lengths.len()).min(MAX_UDP_BATCH_SIZE);
-    let mut iovecs: [libc::iovec; MAX_UDP_BATCH_SIZE] =
-        std::array::from_fn(|_| libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        });
+    let mut iovecs: [libc::iovec; MAX_UDP_BATCH_SIZE] = std::array::from_fn(|_| libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    });
     let mut messages: [libc::mmsghdr; MAX_UDP_BATCH_SIZE] =
         std::array::from_fn(|_| unsafe { std::mem::zeroed() });
 
     for index in 0..count {
-        iovecs[index].iov_base =
-            buffers[index].as_mut_ptr() as *mut libc::c_void;
+        iovecs[index].iov_base = buffers[index].as_mut_ptr() as *mut libc::c_void;
         iovecs[index].iov_len = buffers[index].len();
         messages[index].msg_hdr.msg_iov = &mut iovecs[index];
         messages[index].msg_hdr.msg_iovlen = 1;
@@ -391,15 +370,21 @@ fn recvmmsg_nonblocking(
             lengths[index] = 0;
             tracing::debug!("dropping truncated UDP datagram from recvmmsg batch");
         } else {
-            lengths[index] =
-                (messages[index].msg_len as usize).min(buffers[index].len());
+            lengths[index] = (messages[index].msg_len as usize).min(buffers[index].len());
         }
     }
     Ok(result as usize)
 }
 
-fn create_connected_udp_socket(endpoint: SocketAddr, socket_buffer_size: usize) -> Result<tokio::net::UdpSocket> {
-    let domain = if endpoint.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+fn create_connected_udp_socket(
+    endpoint: SocketAddr,
+    socket_buffer_size: usize,
+) -> Result<tokio::net::UdpSocket> {
+    let domain = if endpoint.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let bind_addr: SocketAddr = if endpoint.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -427,8 +412,7 @@ fn create_connected_udp_socket(endpoint: SocketAddr, socket_buffer_size: usize) 
         .context("failed to set UDP socket nonblocking")?;
 
     let std_sock: std::net::UdpSocket = sock.into();
-    tokio::net::UdpSocket::from_std(std_sock)
-        .context("failed to convert UDP socket to tokio")
+    tokio::net::UdpSocket::from_std(std_sock).context("failed to convert UDP socket to tokio")
 }
 
 pub async fn maintain_native_tun(
@@ -477,15 +461,13 @@ pub async fn maintain_native_tun(
     }
 }
 
-fn prepare_tls_material(
-    cfg: &MasqueConfig,
-    endpoint: &MasqueEndpoint,
-) -> Result<TlsMaterial> {
+fn prepare_tls_material(cfg: &MasqueConfig, endpoint: &MasqueEndpoint) -> Result<TlsMaterial> {
     let key_pem = cfg
         .private_key
         .to_pkcs8_pem(LineEnding::LF)
         .context("failed to encode private key as PKCS8 PEM")?;
-    let key_pair = KeyPair::from_pem(key_pem.as_ref()).context("failed to load key pair into rcgen")?;
+    let key_pair =
+        KeyPair::from_pem(key_pem.as_ref()).context("failed to load key pair into rcgen")?;
 
     let mut params = CertificateParams::new(Vec::<String>::new())
         .context("failed to create certificate parameters")?;
@@ -532,8 +514,8 @@ async fn run_tunnel_session(
     let endpoint = selected_endpoint.addr.0;
     let tls_material = prepare_tls_material(cfg, selected_endpoint)?;
 
-    let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| anyhow!("quiche config: {e}"))?;
+    let mut quic_config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| anyhow!("quiche config: {e}"))?;
     quic_config.verify_peer(false);
     quic_config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -553,6 +535,10 @@ async fn run_tunnel_session(
     };
     quic_config.set_max_recv_udp_payload_size(udp_payload);
     quic_config.set_max_send_udp_payload_size(udp_payload);
+    quic_config.discover_pmtu(cfg.enable_pmtud);
+    if cfg.enable_pmtud {
+        quic_config.set_pmtud_max_probes(cfg.pmtud_max_probes);
+    }
     quic_config.set_initial_max_data(64_000_000);
     quic_config.set_initial_max_stream_data_bidi_local(8_000_000);
     quic_config.set_initial_max_stream_data_bidi_remote(8_000_000);
@@ -562,7 +548,12 @@ async fn run_tunnel_session(
     if !cfg.cc_algorithm.trim().is_empty() {
         quic_config
             .set_cc_algorithm_name(cfg.cc_algorithm.trim())
-            .map_err(|e| anyhow!("set QUIC congestion-control algorithm '{}': {e}", cfg.cc_algorithm.trim()))?;
+            .map_err(|e| {
+                anyhow!(
+                    "set QUIC congestion-control algorithm '{}': {e}",
+                    cfg.cc_algorithm.trim()
+                )
+            })?;
     }
     quic_config.set_initial_congestion_window_packets(cfg.initial_cwnd_packets);
     if cfg.disable_quic_pacing {
@@ -579,8 +570,7 @@ async fn run_tunnel_session(
         // while our CLI intentionally exposes bits per second. Round down so
         // the configured ceiling is never exceeded, with 1 Mbit/s as the
         // smallest non-zero value supported by quiche.
-        let max_pacing_rate_mbps =
-            (cfg.max_pacing_rate_bps / 1_000_000).max(1);
+        let max_pacing_rate_mbps = (cfg.max_pacing_rate_bps / 1_000_000).max(1);
         quic_config.set_max_pacing_rate(max_pacing_rate_mbps);
     }
     let packet_buffer_pool_size = cfg
@@ -588,10 +578,14 @@ async fn run_tunnel_session(
         .clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
     let tx_queue_len = cfg.tx_queue_len.max(1).min(packet_buffer_pool_size);
     tracing::info!(
-        "QUIC tuning: quiche=0.29 cc={} initial_cwnd_packets={} udp_payload={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
+        "QUIC tuning: quiche=0.29.3 cc={} initial_cwnd_packets={} max_udp_payload={} pmtud={} pmtud_max_probes={} initial_tun_mtu={} max_tun_mtu={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
         cfg.cc_algorithm.trim(),
         cfg.initial_cwnd_packets,
         udp_payload,
+        cfg.enable_pmtud,
+        cfg.pmtud_max_probes,
+        cfg.initial_tun_mtu,
+        cfg.max_tun_mtu,
         DGRAM_QUEUE_LEN,
         tx_queue_len,
         cfg.tx_burst_packets,
@@ -615,13 +609,18 @@ async fn run_tunnel_session(
         .map_err(|_| anyhow!("RNG failure"))?;
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn = quiche::connect(Some(&cfg.sni), &scid, local_addr, endpoint, &mut quic_config)
-        .map_err(|e| anyhow!("quiche connect: {e}"))?;
+    let mut conn = quiche::connect(
+        Some(&cfg.sni),
+        &scid,
+        local_addr,
+        endpoint,
+        &mut quic_config,
+    )
+    .map_err(|e| anyhow!("quiche connect: {e}"))?;
 
     let mut out = vec![0u8; MAX_DATAGRAM_SIZE.max(udp_payload)];
     let mut buf = vec![0u8; 65_535];
-    let mut udp_batch =
-        UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.udp_batch_size);
+    let mut udp_batch = UdpBatchIo::new(MAX_DATAGRAM_SIZE.max(udp_payload), cfg.udp_batch_size);
 
     let (write, send_info) = conn
         .send(&mut out)
@@ -664,7 +663,7 @@ async fn run_tunnel_session(
         quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
         quiche::h3::Header::new(b":path", b"/"),
         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        quiche::h3::Header::new(b"user-agent", b""),
+        quiche::h3::Header::new(b"user-agent", cfg.user_agent.as_bytes()),
     ];
     let stream_id = h3_conn
         .send_request(&mut conn, &req, false)
@@ -726,6 +725,9 @@ async fn run_tunnel_session(
         flow_id,
         &stats,
         cfg.keepalive_period,
+        cfg.enable_pmtud,
+        cfg.pmtud_revalidate_period,
+        cfg.max_tun_mtu,
         tx_queue_len,
         cfg.tx_burst_packets.max(1),
         packet_buffer_pool_size,
@@ -835,6 +837,9 @@ async fn data_loop(
     flow_id: u64,
     stats: &Arc<Stats>,
     keepalive_period: Duration,
+    enable_pmtud: bool,
+    pmtud_revalidate_period: Duration,
+    max_tun_mtu: u16,
     tx_queue_len: usize,
     tx_burst_packets: usize,
     packet_buffer_pool_size: usize,
@@ -843,8 +848,7 @@ async fn data_loop(
     let pool_size = packet_buffer_pool_size.clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
     let queue_size = tx_queue_len.min(pool_size).max(1);
     let (tx, mut tx_rx) = tokio::sync::mpsc::channel::<TxDatagram>(queue_size);
-    let (recycle_tx, mut free_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(pool_size);
+    let (recycle_tx, mut free_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(pool_size);
     let reader_dev = dev.clone();
     let reader_stats = stats.clone();
     let reader_flow_prefix = flow_prefix.to_vec();
@@ -908,11 +912,38 @@ async fn data_loop(
         // the client-to-server direction, so postponing PING after a receive can
         // let the path expire before the first probe is transmitted.
         let mut last_keepalive_probe = Instant::now();
+        let mut last_pmtud_revalidation = Instant::now();
+        let mut applied_pmtu: Option<usize> = None;
 
         loop {
             udp_batch.drain_quic(socket, endpoint, local_addr, conn)?;
+            // Receiving an ACK can schedule the next RFC 8899 probe. Drain
+            // quiche immediately so discovery progresses even on an idle TUN.
+            udp_batch.flush_quic(socket, conn).await?;
             poll_h3(conn, h3_conn);
             drain_incoming_datagrams(conn, flow_id, stats, dev).await;
+
+            if enable_pmtud {
+                if let Some(path_pmtu) = conn.pmtu() {
+                    if applied_pmtu != Some(path_pmtu) {
+                        if let Some(tun_mtu) =
+                            discovered_tun_mtu(conn, flow_prefix.len(), max_tun_mtu)
+                        {
+                            let old_mtu = dev.mtu()?;
+                            if old_mtu != tun_mtu {
+                                dev.set_mtu(tun_mtu)?;
+                            }
+                            tracing::info!(
+                                "PMTUD completed: QUIC UDP payload={} bytes, MASQUE TUN MTU={} bytes (was {})",
+                                path_pmtu,
+                                tun_mtu,
+                                old_mtu
+                            );
+                            applied_pmtu = Some(path_pmtu);
+                        }
+                    }
+                }
+            }
 
             for _ in 0..TX_CHANNEL_DRAIN_BURST {
                 if tx_queue.len() >= tx_queue_len {
@@ -972,17 +1003,17 @@ async fn data_loop(
             let quic_timeout = conn.timeout();
             let keepalive_wait =
                 keepalive_remaining(keepalive_period, last_keepalive_probe.elapsed());
-            let (timeout, quic_timeout_due) = match (quic_timeout, keepalive_wait) {
-                (Some(quic), Some(keepalive)) => {
-                    (quic.min(keepalive), quic <= keepalive)
-                }
-                (Some(quic), None) => (quic, true),
-                (None, Some(keepalive)) => (keepalive, false),
-                // No QUIC recovery timer and keepalive disabled. This long timer
-                // only keeps the select branch available; socket/TUN activity
-                // wakes the loop immediately.
-                (None, None) => (Duration::from_secs(60 * 60), false),
-            };
+            let pmtud_wait = pmtud_remaining(
+                enable_pmtud,
+                pmtud_revalidate_period,
+                last_pmtud_revalidation.elapsed(),
+            );
+            let timeout = [quic_timeout, keepalive_wait, pmtud_wait]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(Duration::from_secs(60 * 60));
+            let quic_timeout_due = quic_timeout.is_some_and(|quic| quic <= timeout);
             tokio::select! {
                 result = socket.readable() => {
                     result?;
@@ -1017,6 +1048,18 @@ async fn data_loop(
                             .map_err(|e| anyhow!("failed to schedule QUIC keepalive PING: {e}"))?;
                         tracing::debug!("scheduled periodic QUIC keepalive PING");
                         last_keepalive_probe = Instant::now();
+                        flush = true;
+                    }
+
+                    if pmtud_remaining(
+                        enable_pmtud,
+                        pmtud_revalidate_period,
+                        last_pmtud_revalidation.elapsed(),
+                    ) == Some(Duration::ZERO) {
+                        conn.revalidate_pmtu();
+                        last_pmtud_revalidation = Instant::now();
+                        applied_pmtu = None;
+                        tracing::debug!("scheduled RFC 8899 PMTU revalidation");
                         flush = true;
                     }
 
@@ -1081,7 +1124,10 @@ fn queue_tx_datagrams(
     tx_burst_packets: usize,
     recycle_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> TxProgress {
-    let mut progress = TxProgress { queued: 0, backpressure: false };
+    let mut progress = TxProgress {
+        queued: 0,
+        backpressure: false,
+    };
     let budget = tx_burst_packets.max(1);
 
     while progress.queued < budget {
@@ -1160,7 +1206,9 @@ async fn drain_incoming_datagrams(
                 if let Some(ip_payload) = parse_datagram(dgram_ref, flow_id) {
                     if packet::validate_incoming(ip_payload).is_ok() {
                         stats.rx_packets.fetch_add(1, Ordering::Relaxed);
-                        stats.rx_bytes.fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
+                        stats
+                            .rx_bytes
+                            .fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
                         if let Err(err) = dev.send_packet(ip_payload).await {
                             tracing::warn!("failed to write received packet to TUN: {err:#}");
                         }
@@ -1267,7 +1315,9 @@ async fn send_packet_datagram(
             }
 
             stats.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::trace!("datagram send queue stayed full after backpressure retries, dropping packet");
+            tracing::trace!(
+                "datagram send queue stayed full after backpressure retries, dropping packet"
+            );
             Ok(())
         }
         Err(e) => {
@@ -1281,7 +1331,8 @@ async fn send_packet_datagram(
 fn build_flow_prefix(flow_id: u64) -> Result<Vec<u8>> {
     let mut tmp = [0u8; 8];
     let mut b = OctetsMut::with_slice(&mut tmp);
-    b.put_varint(flow_id).map_err(|e| anyhow!("encode flow_id varint: {e}"))?;
+    b.put_varint(flow_id)
+        .map_err(|e| anyhow!("encode flow_id varint: {e}"))?;
     let len = b.off();
     let mut flow_prefix = Vec::with_capacity(len + 1);
     flow_prefix.extend_from_slice(&tmp[..len]);
@@ -1312,6 +1363,29 @@ fn keepalive_remaining(period: Duration, since_last_probe: Duration) -> Option<D
     } else {
         Some(period.saturating_sub(since_last_probe))
     }
+}
+
+fn pmtud_remaining(
+    enabled: bool,
+    period: Duration,
+    since_last_probe: Duration,
+) -> Option<Duration> {
+    if !enabled || period.is_zero() {
+        None
+    } else {
+        Some(period.saturating_sub(since_last_probe))
+    }
+}
+
+fn discovered_tun_mtu(
+    conn: &quiche::Connection,
+    masque_context_len: usize,
+    maximum: u16,
+) -> Option<u16> {
+    conn.pmtu()?;
+    let writable = conn.dgram_max_writable_len()?;
+    let inner = writable.checked_sub(masque_context_len)?;
+    Some(inner.min(usize::from(maximum)).min(usize::from(u16::MAX)) as u16)
 }
 
 fn spawn_stats_task(stats: Arc<Stats>, start: Instant) -> tokio::task::JoinHandle<()> {
@@ -1358,7 +1432,12 @@ fn format_duration(d: Duration) -> String {
     } else if secs < 3600 {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
-        format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{}h {:02}m {:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     }
 }
 
@@ -1415,6 +1494,30 @@ mod tests {
         );
         assert_eq!(
             keepalive_remaining(Duration::from_secs(25), Duration::from_secs(25)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn pmtud_revalidation_can_be_disabled_independently() {
+        assert_eq!(
+            pmtud_remaining(true, Duration::ZERO, Duration::from_secs(60)),
+            None
+        );
+        assert_eq!(
+            pmtud_remaining(false, Duration::from_secs(600), Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn pmtud_revalidation_uses_remaining_period() {
+        assert_eq!(
+            pmtud_remaining(true, Duration::from_secs(600), Duration::from_secs(125)),
+            Some(Duration::from_secs(475))
+        );
+        assert_eq!(
+            pmtud_remaining(true, Duration::from_secs(600), Duration::from_secs(600)),
             Some(Duration::ZERO)
         );
     }
