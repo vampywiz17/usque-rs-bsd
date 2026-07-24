@@ -87,8 +87,8 @@ pub struct NativeTunArgs {
     /// QUIC congestion-control algorithm. Try: cubic, reno, bbr2_gcongestion.
     #[arg(long, default_value = "cubic")]
     pub cc: String,
-    /// Initial QUIC congestion window in packets. Default quiche value is 10.
-    #[arg(long, default_value_t = 10)]
+    /// Initial QUIC congestion window in packets. FreeBSD upload tests favor 32.
+    #[arg(long, default_value_t = 32)]
     pub initial_cwnd_packets: usize,
     /// Disable quiche's internal pacing decisions. Useful on FreeBSD where SO_TXTIME is unavailable and userspace sleep pacing performed poorly.
     #[arg(long)]
@@ -109,8 +109,9 @@ pub struct NativeTunArgs {
     #[arg(long, default_value_t = 8192)]
     pub tx_queue_len: usize,
     /// Maximum number of TX DATAGRAMs queued into quiche before a flush.
-    /// FreeBSD tests showed 256 is a better default than 128 for upload throughput.
-    #[arg(long, default_value_t = 256)]
+    /// A 16-packet burst avoids severe upload latency without reducing throughput
+    /// on the tested FreeBSD path.
+    #[arg(long, default_value_t = 16)]
     pub tx_burst_packets: usize,
     /// Number of reusable packet buffers shared by the TUN reader and MASQUE
     /// sender. This bounds upload buffering without allocating per packet.

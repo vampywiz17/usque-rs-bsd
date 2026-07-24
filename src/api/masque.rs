@@ -575,7 +575,13 @@ async fn run_tunnel_session(
         quic_config.set_send_capacity_factor(cfg.send_capacity_factor);
     }
     if cfg.max_pacing_rate_bps > 0 {
-        quic_config.set_max_pacing_rate(cfg.max_pacing_rate_bps);
+        // quiche 0.29 interprets this API as an integer number of Mbit/s,
+        // while our CLI intentionally exposes bits per second. Round down so
+        // the configured ceiling is never exceeded, with 1 Mbit/s as the
+        // smallest non-zero value supported by quiche.
+        let max_pacing_rate_mbps =
+            (cfg.max_pacing_rate_bps / 1_000_000).max(1);
+        quic_config.set_max_pacing_rate(max_pacing_rate_mbps);
     }
     let packet_buffer_pool_size = cfg
         .packet_buffer_pool_size

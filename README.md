@@ -74,8 +74,9 @@ The application configures interface addresses and MTU, but does not manage the 
 | `--ipv6` | off | Prefers an IPv6 MASQUE endpoint while retaining IPv4 as fallback |
 | `--mtu` | `1200` | Reduced loss and jitter on the tested MASQUE path |
 | `--initial-packet-size` | `1250` | Leaves room for QUIC/MASQUE overhead |
+| `--initial-cwnd-packets` | `32` | Faster startup without the latency penalty seen at larger packet sizes |
 | `--tx-queue-len` | `8192` | Decouples the TUN reader from QUIC pacing |
-| `--tx-burst-packets` | `256` | Stable upload-performance compromise |
+| `--tx-burst-packets` | `16` | Keeps upload latency low without reducing measured throughput |
 | `--packet-buffer-pool-size` | `1024` | Reusable upload buffers; clamped to `1..16384` and bounds the effective TX queue |
 | `--udp-batch-size` | `32` | FreeBSD `sendmmsg`/`recvmmsg` batch size; clamped to `1..64` |
 | `--keepalive-period` | `25s` | Sends an RFC 9000 QUIC PING after network inactivity; use `0s` to disable |
