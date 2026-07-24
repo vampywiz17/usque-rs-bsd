@@ -1,4 +1,5 @@
 mod connect_ip;
+mod handshake;
 mod stats;
 mod supervisor;
 mod timing;
@@ -10,21 +11,19 @@ use crate::api::hooks::run_hook;
 use crate::api::{icmp, packet};
 use crate::config::MasqueEndpoint;
 use crate::native_tun::TunRsDevice;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use connect_ip::{build_flow_prefix, parse_datagram};
-use p256::pkcs8::{EncodePrivateKey, LineEnding};
+use handshake::{
+    complete_quic_handshake, prepare_tls_material, verify_endpoint_key, wait_connect_response,
+};
 use p256::SecretKey;
 use portable_atomic::Ordering;
-use quiche::h3::NameValue;
-use rcgen::{CertificateParams, KeyPair};
 use ring::rand::SecureRandom;
 use stats::{spawn_stats_task, Stats};
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
 use timing::{discovered_tun_mtu, keepalive_remaining, pmtud_remaining};
 use udp::{create_connected_udp_socket, UdpBatchIo, MAX_DATAGRAM_SIZE, MAX_UDP_BATCH_SIZE};
 
@@ -85,12 +84,6 @@ pub struct MasqueConfig {
     pub device_state: Option<DeviceStateReporter>,
 }
 
-struct TlsMaterial {
-    cert_pem_file: NamedTempFile,
-    key_pem_file: NamedTempFile,
-    endpoint_pub_key_spki_der: Vec<u8>,
-}
-
 struct TxDatagram {
     bytes: Vec<u8>,
     wire_len: usize,
@@ -100,49 +93,6 @@ struct TxDatagram {
 struct TxProgress {
     queued: usize,
     backpressure: bool,
-}
-
-fn prepare_tls_material(cfg: &MasqueConfig, endpoint: &MasqueEndpoint) -> Result<TlsMaterial> {
-    let key_pem = cfg
-        .private_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("failed to encode private key as PKCS8 PEM")?;
-    let key_pair =
-        KeyPair::from_pem(key_pem.as_ref()).context("failed to load key pair into rcgen")?;
-
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .context("failed to create certificate parameters")?;
-    params.not_before = time::OffsetDateTime::now_utc();
-    params.not_after = time::OffsetDateTime::now_utc() + Duration::from_secs(24 * 60 * 60);
-    let cert = params
-        .self_signed(&key_pair)
-        .context("failed to generate self-signed client certificate")?;
-
-    let mut cert_pem_file = NamedTempFile::new().context("failed to create temporary cert file")?;
-    cert_pem_file
-        .write_all(cert.pem().as_bytes())
-        .context("failed to write temporary cert file")?;
-    cert_pem_file.flush()?;
-
-    let mut key_pem_file = NamedTempFile::new().context("failed to create temporary key file")?;
-    key_pem_file
-        .write_all(key_pem.as_bytes())
-        .context("failed to write temporary key file")?;
-    key_pem_file.flush()?;
-
-    Ok(TlsMaterial {
-        cert_pem_file,
-        key_pem_file,
-        endpoint_pub_key_spki_der: endpoint.endpoint_pub_key_spki_der.clone(),
-    })
-}
-
-fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bool {
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(peer_cert_der) else {
-        tracing::warn!("failed to parse peer certificate for key pinning");
-        return false;
-    };
-    cert.tbs_certificate.subject_pki.raw == expected_spki_der
 }
 
 async fn run_tunnel_session(
@@ -395,85 +345,6 @@ async fn run_tunnel_session(
     }
 
     result
-}
-
-async fn complete_quic_handshake(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    buf: &mut [u8],
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    while !conn.is_established() {
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-        tokio::select! {
-            result = socket.recv(buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                conn.recv(&mut buf[..len], recv_info).ok();
-            }
-            () = tokio::time::sleep(timeout) => conn.on_timeout(),
-        }
-        udp_batch.flush_quic(socket, conn).await?;
-        if conn.is_closed() {
-            bail!("connection closed during QUIC handshake");
-        }
-    }
-    Ok(())
-}
-
-async fn wait_connect_response(
-    socket: &tokio::net::UdpSocket,
-    endpoint: SocketAddr,
-    local_addr: SocketAddr,
-    conn: &mut quiche::Connection,
-    h3_conn: &mut quiche::h3::Connection,
-    stream_id: u64,
-    buf: &mut [u8],
-    udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for CONNECT response");
-        }
-        let timeout = conn.timeout().unwrap_or(Duration::from_millis(100));
-        tokio::select! {
-            result = socket.recv(buf) => {
-                let len = result?;
-                let recv_info = quiche::RecvInfo { to: local_addr, from: endpoint };
-                conn.recv(&mut buf[..len], recv_info).ok();
-            }
-            () = tokio::time::sleep(timeout) => conn.on_timeout(),
-        }
-
-        loop {
-            match h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
-                    for h in &list {
-                        if h.name() == b":status" {
-                            let status = std::str::from_utf8(h.value()).unwrap_or("?");
-                            if status.starts_with('2') {
-                                return Ok(());
-                            }
-                            if status == "403" {
-                                bail!("CONNECT rejected with 403; login failed or Access enrollment/certificate is not accepted");
-                            }
-                            bail!("CONNECT rejected with status {status}");
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => bail!("h3 poll error while waiting for CONNECT response: {e}"),
-            }
-        }
-        udp_batch.flush_quic(socket, conn).await?;
-        if conn.is_closed() {
-            bail!("connection closed before CONNECT response");
-        }
-    }
 }
 
 async fn data_loop(
