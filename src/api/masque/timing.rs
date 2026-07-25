@@ -25,6 +25,11 @@ pub(super) fn pmtud_remaining(
     }
 }
 
+fn cap_tun_mtu(writable: usize, masque_context_len: usize, maximum: u16) -> Option<u16> {
+    let inner = writable.checked_sub(masque_context_len)?;
+    Some(inner.min(usize::from(maximum)).min(usize::from(u16::MAX)) as u16)
+}
+
 pub(super) fn discovered_tun_mtu(
     conn: &quiche::Connection,
     masque_context_len: usize,
@@ -32,8 +37,7 @@ pub(super) fn discovered_tun_mtu(
 ) -> Option<u16> {
     conn.pmtu()?;
     let writable = conn.dgram_max_writable_len()?;
-    let inner = writable.checked_sub(masque_context_len)?;
-    Some(inner.min(usize::from(maximum)).min(usize::from(u16::MAX)) as u16)
+    cap_tun_mtu(writable, masque_context_len, maximum)
 }
 
 #[cfg(test)]
@@ -82,5 +86,15 @@ mod tests {
             pmtud_remaining(true, Duration::from_secs(600), Duration::from_secs(600)),
             Some(Duration::ZERO)
         );
+    }
+    #[test]
+    fn inner_mtu_subtracts_connect_ip_context_and_honours_ceiling() {
+        assert_eq!(cap_tun_mtu(1421, 1, 1500), Some(1420));
+        assert_eq!(cap_tun_mtu(1601, 1, 1500), Some(1500));
+    }
+
+    #[test]
+    fn inner_mtu_rejects_an_impossible_context_length() {
+        assert_eq!(cap_tun_mtu(1, 2, 1500), None);
     }
 }

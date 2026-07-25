@@ -40,7 +40,7 @@ bug fix that is not present upstream.
 | --- | --- | --- |
 | Platform and TUN backend | Linux-only `tun` plus `rtnetlink` | Native FreeBSD support through the public `tun-rs` API |
 | QUIC stack | `quiche` 0.22 with fixed 1350-byte UDP payloads | Pinned `quiche` 0.29.3 with RFC 8899 DPLPMTUD |
-| TUN MTU | Fixed at 1280 | Starts conservatively and follows quiche's writable DATAGRAM capacity up to the configured ceiling |
+| TUN MTU and IPv6 | Fixed at 1280 | Starts conservatively, follows quiche's writable DATAGRAM capacity up to the configured ceiling, and activates IPv6 only at the RFC 8200 minimum MTU |
 | Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment and truthful FreeBSD metadata |
 | Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
@@ -139,7 +139,7 @@ other operating systems retain the wire contract but return an empty snapshot.
 | `--connect-port` | `0` | Uses Cloudflare's API-provided endpoint ports; legacy configs fall back to `443`. A non-zero value overrides every endpoint port |
 | `--ipv6` | off | Prefers an IPv6 MASQUE endpoint while retaining IPv4 as fallback |
 | `--mtu` | `1200` | Safe initial TUN MTU used while PMTUD is running |
-| `--max-tun-mtu` | `1280` | Native-compatible inner IP MTU ceiling; may be overridden for experiments |
+| `--max-tun-mtu` | `1500` | Administrative inner-IP ceiling; the effective MTU remains bounded by quiche's discovered DATAGRAM capacity |
 | `--initial-packet-size` | `1472` | Maximum QUIC UDP payload probed by DPLPMTUD |
 | `--pmtud-max-probes` | `3` | RFC 8899 probe failure threshold |
 | `--pmtud-revalidate-period` | `10m` | Rechecks a completed PMTU; `0s` disables periodic revalidation |
@@ -178,6 +178,16 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   `Connection::revalidate_pmtu`. The TUN MTU is derived from quiche's actual
   writable DATAGRAM capacity and applied through `tun-rs::set_mtu`; no
   private QUIC or platform-specific MTU probing is used.
+- With PMTUD enabled, IPv6 assignment is deferred until the discovered inner
+  MTU is at least the RFC 8200 minimum of 1280 bytes. The address is added and
+  removed through tun-rs's native address APIs as path capacity changes or a
+  connection moves to an unvalidated path. IPv4 remains available on smaller
+  paths, matching Cloudflare One Client's documented PMTUD behavior. With
+  `--no-iproute2`, address lifecycle remains the host administrator's
+  responsibility as requested by that option.
+- Oversized inner packets receive ICMPv4 Fragmentation Needed or ICMPv6 Packet
+  Too Big with the current effective TUN MTU, including packets queued before
+  a downward PMTU change.
 - New registrations use a P-256/SPKI key and MASQUE metadata from the first
   API request. Device name, FreeBSD version, model and a privacy-preserving
   stable serial are persisted in `config.json`. The serial is a SHA-256

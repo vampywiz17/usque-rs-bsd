@@ -8,7 +8,7 @@ use crate::api::tunnel::TunnelDevice;
 use crate::config::{self, AppConfig};
 use crate::internal;
 use crate::models::{AccountData, DeviceIdentity, INVALID_PUBLIC_KEY};
-use crate::native_tun::{TunOptions, TunRsDevice};
+use crate::native_tun::{TunOptions, TunRsDevice, IPV6_MIN_MTU};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
@@ -88,9 +88,10 @@ pub struct NativeTunArgs {
     /// discovered MASQUE DATAGRAM capacity, up to --max-tun-mtu.
     #[arg(short = 'm', long, default_value_t = 1200)]
     pub mtu: u16,
-    /// Upper bound for the dynamically discovered TUN MTU. Cloudflare's
-    /// documented MASQUE thresholds are based on a 1280-byte inner packet.
-    #[arg(long, default_value_t = 1280)]
+    /// Administrative upper bound for the dynamically discovered inner IP MTU.
+    /// The effective value is always derived from quiche's writable DATAGRAM
+    /// capacity and never exceeds this ceiling.
+    #[arg(long, default_value_t = 1500)]
     pub max_tun_mtu: u16,
     /// Maximum UDP payload PMTUD may probe. 1472 reaches a 1500-byte IPv4 path;
     /// quiche automatically discovers a lower value for IPv6 or smaller paths.
@@ -303,6 +304,17 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
             args.mtu
         ));
     }
+    let tunnel_ipv6 = !args.no_tunnel_ipv6;
+    if tunnel_ipv6 && args.max_tun_mtu < IPV6_MIN_MTU {
+        return Err(anyhow!(
+            "IPv6 requires --max-tun-mtu of at least 1280; use --no-tunnel-ipv6 for a smaller IPv4-only tunnel"
+        ));
+    }
+    if tunnel_ipv6 && args.disable_pmtud && args.mtu < IPV6_MIN_MTU {
+        return Err(anyhow!(
+            "IPv6 requires --mtu of at least 1280 when PMTUD is disabled; raise --mtu or use --no-tunnel-ipv6"
+        ));
+    }
     if args.keepalive_period.is_zero() {
         tracing::info!("QUIC keepalive is disabled");
     } else {
@@ -341,7 +353,8 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
             mtu: args.mtu,
             configure_addresses: !args.no_iproute2,
             ipv4: !args.no_tunnel_ipv4,
-            ipv6: !args.no_tunnel_ipv6,
+            ipv6: tunnel_ipv6,
+            defer_ipv6: tunnel_ipv6 && !args.disable_pmtud,
             persist: args.persist,
         },
     )
@@ -386,6 +399,7 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
             revalidate_period: args.pmtud_revalidate_period,
             initial_tun_mtu: args.mtu,
             max_tun_mtu: args.max_tun_mtu,
+            tunnel_ipv6,
         },
         io: DatagramIoConfig {
             udp_socket_buffer: args.udp_socket_buffer,

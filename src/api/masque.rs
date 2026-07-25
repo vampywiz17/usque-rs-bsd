@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 use timing::{discovered_tun_mtu, keepalive_remaining, pmtud_remaining};
 use udp::{create_connected_udp_socket, UdpBatchIo, MAX_DATAGRAM_SIZE, MAX_UDP_BATCH_SIZE};
 
-const MIN_MTU: u16 = 1280;
 const DGRAM_QUEUE_LEN: usize = 16_384;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
 const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
@@ -49,6 +48,7 @@ pub struct PathMtuConfig {
     pub revalidate_period: Duration,
     pub initial_tun_mtu: u16,
     pub max_tun_mtu: u16,
+    pub tunnel_ipv6: bool,
 }
 
 pub struct DatagramIoConfig {
@@ -93,6 +93,7 @@ struct TxDatagram {
 struct TxProgress {
     queued: usize,
     backpressure: bool,
+    icmp_packets: Vec<Vec<u8>>,
 }
 
 async fn run_tunnel_session(
@@ -455,9 +456,7 @@ async fn data_loop(
                             discovered_tun_mtu(conn, flow_prefix.len(), max_tun_mtu)
                         {
                             let old_mtu = dev.mtu()?;
-                            if old_mtu != tun_mtu {
-                                dev.set_mtu(tun_mtu)?;
-                            }
+                            dev.apply_path_mtu(tun_mtu, true)?;
                             tracing::info!(
                                 "PMTUD completed: QUIC UDP payload={} bytes, MASQUE TUN MTU={} bytes (was {})",
                                 path_pmtu,
@@ -492,7 +491,14 @@ async fn data_loop(
                 stats,
                 tx_burst_packets,
                 &recycle_tx,
+                flow_prefix.len(),
+                dev.current_mtu(),
             );
+            for icmp_packet in &progress.icmp_packets {
+                if let Err(err) = dev.send_packet(&icmp_packet).await {
+                    tracing::debug!("failed to return ICMP Packet Too Big to TUN: {err:#}");
+                }
+            }
             if progress.queued > 0 {
                 udp_batch.flush_quic(socket, conn).await?;
             } else if progress.backpressure {
@@ -658,7 +664,7 @@ async fn build_tx_datagram(
                 dgram.len(),
                 max_len
             );
-            if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&pkt, MIN_MTU) {
+            if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&pkt, dev.current_mtu()) {
                 let _ = dev.send_packet(&icmp_pkt).await;
             }
             return None;
@@ -679,10 +685,13 @@ fn queue_tx_datagrams(
     stats: &Arc<Stats>,
     tx_burst_packets: usize,
     recycle_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    flow_prefix_len: usize,
+    effective_tun_mtu: u16,
 ) -> TxProgress {
     let mut progress = TxProgress {
         queued: 0,
         backpressure: false,
+        icmp_packets: Vec::new(),
     };
     let budget = tx_burst_packets.max(1);
 
@@ -699,6 +708,14 @@ fn queue_tx_datagrams(
                     item.wire_len,
                     max_len
                 );
+                if item.wire_len >= flow_prefix_len {
+                    if let Some(packet) = icmp::compose_icmp_too_large(
+                        &item.bytes[flow_prefix_len..item.wire_len],
+                        effective_tun_mtu,
+                    ) {
+                        progress.icmp_packets.push(packet);
+                    }
+                }
                 let _ = recycle_tx.try_send(item.bytes);
                 continue;
             }
@@ -807,7 +824,7 @@ async fn send_packet_datagram(
                         dgram.len(),
                         max_len
                     );
-                    if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, MIN_MTU) {
+                    if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, dev.current_mtu()) {
                         let _ = dev.send_packet(&icmp_pkt).await;
                     }
                     return Ok(());
@@ -829,10 +846,7 @@ async fn send_packet_datagram(
                         }
                         Err(e) => {
                             stats.dropped.fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!("datagram send_buf error: {e}; generating ICMP Packet Too Big if possible");
-                            if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, MIN_MTU) {
-                                let _ = dev.send_packet(&icmp_pkt).await;
-                            }
+                            tracing::debug!("datagram send_buf error: {e}; dropping packet");
                             return Ok(());
                         }
                     }
