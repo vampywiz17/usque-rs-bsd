@@ -12,6 +12,17 @@ use std::time::Instant;
 
 pub(super) const MAX_DATAGRAM_SIZE: usize = 1500;
 pub(super) const MAX_UDP_BATCH_SIZE: usize = 64;
+const MIN_UDP_SOCKET_BUFFER: usize = 64 * 1024;
+const UDP_SOCKET_BUFFER_SEARCH_GRANULARITY: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct SocketBufferTuning {
+    initial: usize,
+    effective: usize,
+    target: usize,
+    target_accepted: bool,
+    limit_error: Option<std::io::Error>,
+}
 
 pub(super) struct UdpBatchIo {
     tx_buffers: Vec<Vec<u8>>,
@@ -288,6 +299,114 @@ fn recvmmsg_nonblocking(
     Ok(result as usize)
 }
 
+fn tune_socket_buffer<Get, Set>(
+    requested_target: usize,
+    mut get_size: Get,
+    mut set_size: Set,
+) -> std::io::Result<SocketBufferTuning>
+where
+    Get: FnMut() -> std::io::Result<usize>,
+    Set: FnMut(usize) -> std::io::Result<()>,
+{
+    let target = requested_target.max(MIN_UDP_SOCKET_BUFFER);
+    let initial = get_size()?;
+    if initial >= target {
+        return Ok(SocketBufferTuning {
+            initial,
+            effective: initial,
+            target,
+            target_accepted: true,
+            limit_error: None,
+        });
+    }
+
+    let mut effective = initial;
+    let mut accepted_request = None;
+    let mut candidate = MIN_UDP_SOCKET_BUFFER;
+
+    loop {
+        // Never replace a larger kernel default with a smaller requested value.
+        if candidate > initial {
+            match set_size(candidate) {
+                Ok(()) => {
+                    effective = get_size()?;
+                    accepted_request = Some(candidate);
+                }
+                Err(mut limit_error) => {
+                    // A rejected power-of-two step only establishes an upper bound.
+                    // Refine it so kernels with a non-power-of-two cap can still
+                    // grant nearly all available capacity.
+                    if let Some(mut low) = accepted_request {
+                        let mut high = candidate;
+                        while high.saturating_sub(low) > UDP_SOCKET_BUFFER_SEARCH_GRANULARITY {
+                            let midpoint = low + (high - low) / 2;
+                            let midpoint = (midpoint / UDP_SOCKET_BUFFER_SEARCH_GRANULARITY)
+                                * UDP_SOCKET_BUFFER_SEARCH_GRANULARITY;
+                            if midpoint <= low {
+                                break;
+                            }
+                            match set_size(midpoint) {
+                                Ok(()) => {
+                                    low = midpoint;
+                                    effective = get_size()?;
+                                }
+                                Err(err) => {
+                                    high = midpoint;
+                                    limit_error = err;
+                                }
+                            }
+                        }
+                    }
+
+                    return Ok(SocketBufferTuning {
+                        initial,
+                        effective,
+                        target,
+                        target_accepted: false,
+                        limit_error: Some(limit_error),
+                    });
+                }
+            }
+        }
+
+        if candidate == target {
+            return Ok(SocketBufferTuning {
+                initial,
+                effective,
+                target,
+                target_accepted: true,
+                limit_error: None,
+            });
+        }
+        candidate = candidate.saturating_mul(2).min(target);
+    }
+}
+
+fn log_socket_buffer_tuning(direction: &str, result: std::io::Result<SocketBufferTuning>) {
+    match result {
+        Ok(tuning) if tuning.target_accepted => tracing::info!(
+            "UDP {direction} socket buffer: system_default={} target={} effective={}",
+            tuning.initial,
+            tuning.target,
+            tuning.effective
+        ),
+        Ok(tuning) => tracing::warn!(
+            "UDP {direction} socket buffer is OS-limited: system_default={} target={} effective={}: {}",
+            tuning.initial,
+            tuning.target,
+            tuning.effective,
+            tuning
+                .limit_error
+                .as_ref()
+                .map(std::io::Error::to_string)
+                .unwrap_or_else(|| "socket option rejected".to_string())
+        ),
+        Err(err) => tracing::warn!(
+            "failed to query or verify UDP {direction} socket buffer; retaining the kernel-managed value: {err}"
+        ),
+    }
+}
+
 pub(super) fn create_connected_udp_socket(
     endpoint: SocketAddr,
     socket_buffer_size: usize,
@@ -306,15 +425,25 @@ pub(super) fn create_connected_udp_socket(
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
         .context("failed to create UDP socket")?;
 
-    // MASQUE/WARP sends a lot of QUIC DATAGRAM traffic. The FreeBSD defaults can be
-    // too small for iperf bursts, which shows up as TCP retransmits inside the tunnel.
-    let sockbuf = socket_buffer_size.max(64 * 1024);
-    if let Err(err) = sock.set_recv_buffer_size(sockbuf) {
-        tracing::warn!("failed to set UDP recv buffer size to {sockbuf}: {err}");
-    }
-    if let Err(err) = sock.set_send_buffer_size(sockbuf) {
-        tracing::warn!("failed to set UDP send buffer size to {sockbuf}: {err}");
-    }
+    // Socket buffer sizing is a per-socket capability negotiation. Start with
+    // the kernel default, grow toward the configured ceiling and verify every
+    // accepted SO_RCVBUF/SO_SNDBUF value. A system-wide sysctl is never changed.
+    log_socket_buffer_tuning(
+        "receive",
+        tune_socket_buffer(
+            socket_buffer_size,
+            || sock.recv_buffer_size(),
+            |size| sock.set_recv_buffer_size(size),
+        ),
+    );
+    log_socket_buffer_tuning(
+        "send",
+        tune_socket_buffer(
+            socket_buffer_size,
+            || sock.send_buffer_size(),
+            |size| sock.set_send_buffer_size(size),
+        ),
+    );
 
     sock.bind(&SockAddr::from(bind_addr))
         .context("failed to bind UDP socket")?;
@@ -325,4 +454,98 @@ pub(super) fn create_connected_udp_socket(
 
     let std_sock: std::net::UdpSocket = sock.into();
     tokio::net::UdpSocket::from_std(std_sock).context("failed to convert UDP socket to tokio")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Debug)]
+    struct FakeSocketBuffer {
+        current: usize,
+        maximum: usize,
+        requests: Vec<usize>,
+    }
+
+    impl FakeSocketBuffer {
+        fn set(&mut self, size: usize) -> std::io::Result<()> {
+            self.requests.push(size);
+            if size > self.maximum {
+                Err(std::io::Error::from_raw_os_error(libc::ENOBUFS))
+            } else {
+                self.current = size;
+                Ok(())
+            }
+        }
+    }
+
+    fn tune_fake(
+        initial: usize,
+        maximum: usize,
+        target: usize,
+    ) -> (SocketBufferTuning, FakeSocketBuffer) {
+        let state = RefCell::new(FakeSocketBuffer {
+            current: initial,
+            maximum,
+            requests: Vec::new(),
+        });
+        let tuning = tune_socket_buffer(
+            target,
+            || Ok(state.borrow().current),
+            |size| state.borrow_mut().set(size),
+        )
+        .unwrap();
+        (tuning, state.into_inner())
+    }
+
+    #[test]
+    fn socket_buffer_tuning_reaches_supported_target() {
+        let target = 8 * 1024 * 1024;
+        let (tuning, state) = tune_fake(32 * 1024, target, target);
+
+        assert!(tuning.target_accepted);
+        assert_eq!(tuning.effective, target);
+        assert_eq!(state.requests.last(), Some(&target));
+    }
+
+    #[test]
+    fn socket_buffer_tuning_refines_non_power_of_two_limit() {
+        let maximum = 3_600_000;
+        let (tuning, _) = tune_fake(32 * 1024, maximum, 8 * 1024 * 1024);
+
+        assert!(!tuning.target_accepted);
+        assert!(tuning.limit_error.is_some());
+        assert!(tuning.effective <= maximum);
+        assert!(maximum - tuning.effective < UDP_SOCKET_BUFFER_SEARCH_GRANULARITY);
+    }
+
+    #[test]
+    fn socket_buffer_tuning_retains_default_when_growth_is_rejected() {
+        let initial = 128 * 1024;
+        let (tuning, _) = tune_fake(initial, 100 * 1024, 8 * 1024 * 1024);
+
+        assert!(!tuning.target_accepted);
+        assert_eq!(tuning.effective, initial);
+    }
+
+    #[test]
+    fn socket_buffer_tuning_does_not_reduce_large_kernel_default() {
+        let initial = 16 * 1024 * 1024;
+        let (tuning, state) = tune_fake(initial, initial, 8 * 1024 * 1024);
+
+        assert!(tuning.target_accepted);
+        assert_eq!(tuning.effective, initial);
+        assert!(state.requests.is_empty());
+    }
+
+    #[test]
+    fn socket_buffer_tuning_accepts_exact_non_power_of_two_target() {
+        let target = 3_500_000;
+        let (tuning, state) = tune_fake(32 * 1024, target, target);
+
+        assert!(tuning.target_accepted);
+        assert_eq!(tuning.effective, target);
+        assert_eq!(state.requests.last(), Some(&target));
+    }
 }

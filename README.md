@@ -47,7 +47,7 @@ bug fix that is not present upstream.
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
 | Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks |
-| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, socket-buffer tuning and configurable congestion control/initial CWND |
+| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 
 The project deliberately remains tunnel-only. It does not take ownership of
@@ -148,7 +148,15 @@ other operating systems retain the wire contract but return an empty snapshot.
 | `--tx-burst-packets` | `16` | Keeps upload latency low without reducing measured throughput |
 | `--packet-buffer-pool-size` | `1024` | Reusable upload buffers; clamped to `1..16384` and bounds the effective TX queue |
 | `--udp-batch-size` | `32` | FreeBSD `sendmmsg`/`recvmmsg` batch size; clamped to `1..64` |
+| `--udp-socket-buffer` | `8388608` | Desired per-direction growth target. Each new socket starts from the OS default, grows adaptively, verifies the effective `SO_RCVBUF`/`SO_SNDBUF` value and retains the largest accepted size |
 | `--keepalive-period` | `25s` | Periodically schedules an RFC 9000 QUIC PING to preserve QUIC and outbound UDP/NAT state; use `0s` to disable |
+
+Socket-buffer negotiation is local and per socket: it never changes
+`kern.ipc.maxsockbuf` or any other system-wide setting. If the kernel rejects
+the requested target, the log reports the original default, requested target
+and largest effective size. Receive and send limits are negotiated
+independently on every connection and reconnect, so the same binary adapts to
+both stock FreeBSD/OPNsense limits and explicitly tuned hosts.
 
 Optional tuning example:
 
@@ -210,6 +218,12 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   transitions without changing MASQUE framing. A packet is batched only after
   its quiche pacing deadline, so the syscall optimization does not bypass QUIC
   congestion-control timing.
+- UDP receive and send buffers are negotiated independently through socket2's
+  public `SO_RCVBUF`/`SO_SNDBUF` APIs before bind/connect. The implementation
+  reads the kernel default, probes upward to the configured target, verifies
+  every accepted value with `getsockopt`, and performs a bounded 64 KiB-granular
+  refinement when a limit is encountered. Failure is non-fatal and preserves
+  the last accepted or kernel-default value; no global kernel setting is changed.
 - The TUN reader uses a bounded reusable buffer pool. Because quiche owns its
   internal DATAGRAM queue, the pooled buffer is copied once with
   `Connection::dgram_send()` and immediately returned to the pool. This trades

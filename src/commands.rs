@@ -125,7 +125,8 @@ pub struct NativeTunArgs {
     /// Optional maximum pacing rate in bits per second. 0 means no explicit limit.
     #[arg(long, default_value_t = 0)]
     pub max_pacing_rate_bps: u64,
-    /// UDP socket receive/send buffer requested from the OS, in bytes.
+    /// Desired per-direction UDP socket-buffer growth target in bytes. The effective
+    /// value is negotiated with and verified against the OS (minimum 64 KiB).
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     pub udp_socket_buffer: usize,
     /// Number of already-encoded MASQUE DATAGRAMs kept in the userspace TX queue.
@@ -296,6 +297,13 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
     let cfg = AppConfig::load(config_path)?;
     if !args.interface_name.is_empty() {
         internal::check_ifname(&args.interface_name)?;
+    }
+    if args.udp_socket_buffer > libc::c_int::MAX as usize {
+        return Err(anyhow!(
+            "--udp-socket-buffer ({}) exceeds the largest value supported by SO_RCVBUF/SO_SNDBUF ({})",
+            args.udp_socket_buffer,
+            libc::c_int::MAX
+        ));
     }
     if args.max_tun_mtu < args.mtu {
         return Err(anyhow!(

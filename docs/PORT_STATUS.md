@@ -20,6 +20,9 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 - FreeBSD UDP send/receive batching included with native
   `sendmmsg`/`recvmmsg` (`32` packets per syscall by default).
 - Outbound batches retain quiche's per-packet pacing deadline.
+- UDP receive/send buffers start from the kernel default and adapt independently
+  toward the configured target through verified `SO_RCVBUF`/`SO_SNDBUF`
+  operations; OS limits are retained without changing global sysctls.
 - Full Cloudflare MASQUE peer/address/port list is retained at enrollment.
   Reconnects rotate across API-provided ports and IPv4/IPv6 endpoints while
   preserving peer-specific certificate pins.
