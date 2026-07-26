@@ -19,6 +19,7 @@ use handshake::{
 use p256::SecretKey;
 use portable_atomic::Ordering;
 use ring::rand::SecureRandom;
+use serde::Serialize;
 use stats::{spawn_stats_task, Stats};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -30,6 +31,7 @@ use udp::{create_connected_udp_socket, UdpBatchIo, MAX_DATAGRAM_SIZE, MAX_UDP_BA
 const DGRAM_QUEUE_LEN: usize = 16_384;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
 const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
+const MESH_H3_STATS_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct QuicTransportConfig {
     pub keepalive_period: Duration,
@@ -70,18 +72,163 @@ pub struct LifecycleHooks {
     pub env: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudflareConnectProfile {
+    Client,
+    MeshNode { client_version: String },
+}
+
+impl CloudflareConnectProfile {
+    fn reports_h3_stats(&self) -> bool {
+        matches!(self, Self::MeshNode { .. })
+    }
+}
+
 pub struct MasqueConfig {
     pub private_key: SecretKey,
     pub sni: String,
     pub insecure: bool,
     pub endpoints: Vec<MasqueEndpoint>,
     pub user_agent: String,
+    pub connect_profile: CloudflareConnectProfile,
     pub quic: QuicTransportConfig,
     pub path_mtu: PathMtuConfig,
     pub io: DatagramIoConfig,
     pub reconnect: ReconnectPolicy,
     pub hooks: LifecycleHooks,
     pub device_state: Option<DeviceStateReporter>,
+}
+
+fn connect_request_headers(
+    profile: &CloudflareConnectProfile,
+    user_agent: &str,
+    pq_enabled: bool,
+) -> Vec<quiche::h3::Header> {
+    let scheme: &[u8] = match profile {
+        CloudflareConnectProfile::Client => b"https",
+        CloudflareConnectProfile::MeshNode { .. } => b"http",
+    };
+    let mut headers = vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+        quiche::h3::Header::new(b":scheme", scheme),
+        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+        quiche::h3::Header::new(b":path", b"/"),
+    ];
+    match profile {
+        CloudflareConnectProfile::Client => {
+            headers.push(quiche::h3::Header::new(b"capsule-protocol", b"?1"));
+            headers.push(quiche::h3::Header::new(
+                b"user-agent",
+                user_agent.as_bytes(),
+            ));
+        }
+        CloudflareConnectProfile::MeshNode { client_version } => {
+            // Cloudflare's Linux-only Connector contract prefixes its actual
+            // client version with `l-`. The version remains this program's own
+            // version; it never claims an official Cloudflare release.
+            let cf_client_version = format!("l-{client_version}");
+            headers.push(quiche::h3::Header::new(
+                b"pq-enabled",
+                if pq_enabled { b"true" } else { b"false" },
+            ));
+            headers.push(quiche::h3::Header::new(
+                b"cf-client-version",
+                cf_client_version.as_bytes(),
+            ));
+        }
+    }
+    headers
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct H3StatsRequest {
+    schema_version: &'static str,
+    stats: H3StatsFields,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct H3StatsFields {
+    rtt_us: u64,
+    min_rtt_us: u64,
+    rtt_var_us: u64,
+    packets_sent: usize,
+    packets_recvd: usize,
+    packets_lost: usize,
+    packets_retrans: usize,
+    bytes_sent: u64,
+    bytes_recvd: u64,
+    bytes_lost: u64,
+    bytes_retrans: u64,
+}
+
+struct PendingH3StatsReport {
+    stream_id: u64,
+    body: Vec<u8>,
+    written: usize,
+}
+
+fn h3_stats_request_headers() -> [quiche::h3::Header; 4] {
+    [
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":scheme", b"http"),
+        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+        quiche::h3::Header::new(b":path", b"/h3-stats"),
+    ]
+}
+
+fn h3_stats_request(conn: &quiche::Connection) -> Option<H3StatsRequest> {
+    let path = conn.path_stats().find(|path| path.active)?;
+    let micros = |duration: Duration| duration.as_micros().min(u128::from(u64::MAX)) as u64;
+    Some(H3StatsRequest {
+        schema_version: "0",
+        stats: H3StatsFields {
+            rtt_us: micros(path.rtt),
+            min_rtt_us: micros(path.min_rtt.unwrap_or(path.rtt)),
+            rtt_var_us: micros(path.rttvar),
+            packets_sent: path.sent,
+            packets_recvd: path.recv,
+            packets_lost: path.lost,
+            packets_retrans: path.retrans,
+            bytes_sent: path.sent_bytes,
+            bytes_recvd: path.recv_bytes,
+            bytes_lost: path.lost_bytes,
+            bytes_retrans: path.stream_retrans_bytes,
+        },
+    })
+}
+
+fn start_h3_stats_report(
+    conn: &mut quiche::Connection,
+    h3_conn: &mut quiche::h3::Connection,
+) -> Result<Option<PendingH3StatsReport>> {
+    let Some(request) = h3_stats_request(conn) else {
+        return Ok(None);
+    };
+    let body = serde_json::to_vec(&request).map_err(|err| anyhow!("serialize H3 stats: {err}"))?;
+    let stream_id = h3_conn
+        .send_request(conn, &h3_stats_request_headers(), false)
+        .map_err(|err| anyhow!("send H3 stats request: {err}"))?;
+    Ok(Some(PendingH3StatsReport {
+        stream_id,
+        body,
+        written: 0,
+    }))
+}
+
+fn flush_h3_stats_report(
+    conn: &mut quiche::Connection,
+    h3_conn: &mut quiche::h3::Connection,
+    report: &mut PendingH3StatsReport,
+) -> Result<bool> {
+    match h3_conn.send_body(conn, report.stream_id, &report.body[report.written..], true) {
+        Ok(written) => {
+            report.written += written;
+            Ok(report.written == report.body.len())
+        }
+        Err(quiche::h3::Error::Done) => Ok(false),
+        Err(err) => Err(anyhow!("send H3 stats body: {err}")),
+    }
 }
 
 struct TxDatagram {
@@ -106,7 +253,6 @@ async fn run_tunnel_session(
     let connection_started = Instant::now();
     let endpoint = selected_endpoint.addr.0;
     let tls_material = prepare_tls_material(cfg, selected_endpoint)?;
-
     let mut quic_config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| anyhow!("quiche config: {e}"))?;
     quic_config.verify_peer(false);
@@ -233,6 +379,7 @@ async fn run_tunnel_session(
         &mut udp_batch,
     )
     .await?;
+    let pq_enabled = false;
 
     if !cfg.insecure {
         if let Some(peer_cert) = conn.peer_cert() {
@@ -252,15 +399,7 @@ async fn run_tunnel_session(
     let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
         .map_err(|e| anyhow!("h3 connection: {e}"))?;
 
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"CONNECT"),
-        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-        quiche::h3::Header::new(b":path", b"/"),
-        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        quiche::h3::Header::new(b"user-agent", cfg.user_agent.as_bytes()),
-    ];
+    let req = connect_request_headers(&cfg.connect_profile, &cfg.user_agent, pq_enabled);
     let stream_id = h3_conn
         .send_request(&mut conn, &req, false)
         .map_err(|e| anyhow!("send CONNECT request: {e}"))?;
@@ -324,6 +463,7 @@ async fn run_tunnel_session(
         flow_id,
         &stats,
         cfg.device_state.as_ref(),
+        cfg.connect_profile.reports_h3_stats(),
         cfg.quic.keepalive_period,
         cfg.path_mtu.enabled,
         cfg.path_mtu.revalidate_period,
@@ -361,6 +501,7 @@ async fn data_loop(
     flow_id: u64,
     stats: &Arc<Stats>,
     device_state: Option<&DeviceStateReporter>,
+    report_h3_stats: bool,
     keepalive_period: Duration,
     enable_pmtud: bool,
     pmtud_revalidate_period: Duration,
@@ -433,6 +574,9 @@ async fn data_loop(
         let mut tx_queue: VecDeque<TxDatagram> = VecDeque::with_capacity(tx_queue_len.min(65_536));
         let mut tun_reader_closed = false;
         let mut last_telemetry_sample = Instant::now() - Duration::from_secs(1);
+        // Publish the initial Mesh path state as soon as CONNECT succeeds.
+        let mut last_h3_stats_report = Instant::now() - MESH_H3_STATS_INTERVAL;
+        let mut pending_h3_stats_report: Option<PendingH3StatsReport> = None;
         // Drive keepalive from a periodic outbound deadline, not from received
         // packets. Incoming traffic does not reliably refresh UDP/NAT state in
         // the client-to-server direction, so postponing PING after a receive can
@@ -448,6 +592,36 @@ async fn data_loop(
             udp_batch.flush_quic(socket, conn).await?;
             poll_h3(conn, h3_conn);
             drain_incoming_datagrams(conn, flow_id, stats, dev).await;
+
+            let mut h3_output_queued = false;
+            if report_h3_stats
+                && pending_h3_stats_report.is_none()
+                && last_h3_stats_report.elapsed() >= MESH_H3_STATS_INTERVAL
+            {
+                last_h3_stats_report = Instant::now();
+                match start_h3_stats_report(conn, h3_conn) {
+                    Ok(Some(report)) => pending_h3_stats_report = Some(report),
+                    Ok(None) => tracing::debug!("active QUIC path is not ready for H3 stats"),
+                    Err(err) => tracing::warn!("failed to start H3 tunnel stats report: {err:#}"),
+                }
+            }
+            if let Some(report) = pending_h3_stats_report.as_mut() {
+                h3_output_queued = true;
+                match flush_h3_stats_report(conn, h3_conn, report) {
+                    Ok(true) => {
+                        tracing::debug!("reported truthful QUIC path stats over H3");
+                        pending_h3_stats_report = None;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!("failed to finish H3 tunnel stats report: {err:#}");
+                        pending_h3_stats_report = None;
+                    }
+                }
+            }
+            if h3_output_queued {
+                udp_batch.flush_quic(socket, conn).await?;
+            }
 
             if enable_pmtud {
                 if let Some(path_pmtu) = conn.pmtu() {
@@ -544,7 +718,12 @@ async fn data_loop(
                 pmtud_revalidate_period,
                 last_pmtud_revalidation.elapsed(),
             );
-            let timeout = [quic_timeout, keepalive_wait, pmtud_wait]
+            let h3_stats_wait = if report_h3_stats && pending_h3_stats_report.is_none() {
+                Some(MESH_H3_STATS_INTERVAL.saturating_sub(last_h3_stats_report.elapsed()))
+            } else {
+                None
+            };
+            let timeout = [quic_timeout, keepalive_wait, pmtud_wait, h3_stats_wait]
                 .into_iter()
                 .flatten()
                 .min()
@@ -754,8 +933,49 @@ fn queue_tx_datagrams(
 }
 
 fn poll_h3(conn: &mut quiche::Connection, h3_conn: &mut quiche::h3::Connection) {
+    use quiche::h3::NameValue as _;
+
+    let mut discard = [0u8; 4096];
     loop {
         match h3_conn.poll(conn) {
+            Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                if let Some(status) = list
+                    .iter()
+                    .find(|header| header.name() == b":status")
+                    .map(|header| header.value())
+                {
+                    tracing::debug!(
+                        stream_id,
+                        status = %String::from_utf8_lossy(status),
+                        "received H3 control response status"
+                    );
+                    if status != b"200" {
+                        tracing::warn!(
+                            "H3 control request on stream {stream_id} returned status {}",
+                            String::from_utf8_lossy(status)
+                        );
+                    }
+                }
+            }
+            Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                match h3_conn.recv_body(conn, stream_id, &mut discard) {
+                    Ok(0) | Err(quiche::h3::Error::Done) => break,
+                    Ok(read) => {
+                        tracing::debug!(
+                            stream_id,
+                            response_bytes = read,
+                            "received H3 control response body"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!("failed to drain H3 response body: {err}");
+                        break;
+                    }
+                }
+            },
+            Ok((stream_id, quiche::h3::Event::Reset(code))) => {
+                tracing::warn!("H3 control stream {stream_id} was reset with code {code}");
+            }
             Ok(_) => {}
             Err(quiche::h3::Error::Done) => break,
             Err(e) => {
@@ -901,6 +1121,98 @@ async fn send_packet_datagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quiche::h3::NameValue;
+
+    fn header_value<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'a [u8]> {
+        headers
+            .iter()
+            .find(|header| header.name() == name)
+            .map(|header| header.value())
+    }
+
+    #[test]
+    fn client_connect_profile_preserves_existing_headers() {
+        let headers = connect_request_headers(&CloudflareConnectProfile::Client, "usque-test", false);
+        assert_eq!(header_value(&headers, b":scheme"), Some(&b"https"[..]));
+        assert_eq!(
+            header_value(&headers, b"capsule-protocol"),
+            Some(&b"?1"[..])
+        );
+        assert_eq!(
+            header_value(&headers, b"user-agent"),
+            Some(&b"usque-test"[..])
+        );
+        assert_eq!(header_value(&headers, b"pq-enabled"), None);
+        assert_eq!(header_value(&headers, b"cf-client-version"), None);
+    }
+
+    #[test]
+    fn mesh_connect_profile_uses_truthful_connector_headers() {
+        let headers = connect_request_headers(
+            &CloudflareConnectProfile::MeshNode {
+                client_version: "0.7.0".to_string(),
+            },
+            "unused-in-mesh",
+            false,
+        );
+        assert_eq!(headers.len(), 7);
+        assert_eq!(header_value(&headers, b":method"), Some(&b"CONNECT"[..]));
+        assert_eq!(
+            header_value(&headers, b":protocol"),
+            Some(&b"cf-connect-ip"[..])
+        );
+        assert_eq!(header_value(&headers, b":scheme"), Some(&b"http"[..]));
+        assert_eq!(header_value(&headers, b"pq-enabled"), Some(&b"false"[..]));
+        assert_eq!(
+            header_value(&headers, b"cf-client-version"),
+            Some(&b"l-0.7.0"[..])
+        );
+        assert_eq!(header_value(&headers, b"capsule-protocol"), None);
+        assert_eq!(header_value(&headers, b"user-agent"), None);
+    }
+
+    #[test]
+    fn only_mesh_profile_reports_h3_stats() {
+        assert!(!CloudflareConnectProfile::Client.reports_h3_stats());
+        assert!(CloudflareConnectProfile::MeshNode {
+            client_version: "0.7.0".to_string(),
+        }
+        .reports_h3_stats());
+    }
+
+    #[test]
+    fn h3_stats_request_matches_connector_schema() {
+        let headers = h3_stats_request_headers();
+        assert_eq!(headers.len(), 4);
+        assert_eq!(header_value(&headers, b":method"), Some(&b"POST"[..]));
+        assert_eq!(header_value(&headers, b":scheme"), Some(&b"http"[..]));
+        assert_eq!(
+            header_value(&headers, b":authority"),
+            Some(&b"cloudflareaccess.com"[..])
+        );
+        assert_eq!(header_value(&headers, b":path"), Some(&b"/h3-stats"[..]));
+
+        let request = H3StatsRequest {
+            schema_version: "0",
+            stats: H3StatsFields {
+                rtt_us: 16_051,
+                min_rtt_us: 15_260,
+                rtt_var_us: 2_926,
+                packets_sent: 18,
+                packets_recvd: 13,
+                packets_lost: 2,
+                packets_retrans: 2,
+                bytes_sent: 6_171,
+                bytes_recvd: 3_898,
+                bytes_lost: 111,
+                bytes_retrans: 25,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"schema_version":"0","stats":{"rtt_us":16051,"min_rtt_us":15260,"rtt_var_us":2926,"packets_sent":18,"packets_recvd":13,"packets_lost":2,"packets_retrans":2,"bytes_sent":6171,"bytes_recvd":3898,"bytes_lost":111,"bytes_retrans":25}}"#
+        );
+    }
 
     #[test]
     fn udp_batch_size_is_bounded() {

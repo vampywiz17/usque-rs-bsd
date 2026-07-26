@@ -1,7 +1,8 @@
 use crate::api::cloudflare;
 use crate::api::freebsd_telemetry::InterfaceSnapshot;
 use crate::api::freebsd_telemetry::{HostSnapshot, HostTelemetryCollector, IpSnapshot};
-use crate::config::AppConfig;
+use crate::api::mesh;
+use crate::config::{AppConfig, TunnelRole};
 use crate::internal;
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -25,7 +26,7 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// responsible only for the standards-compliant QUIC tunnel.
 #[derive(Clone)]
 pub struct DeviceStateReporter {
-    state_tx: watch::Sender<ConnectionState>,
+    state_tx: watch::Sender<Option<ConnectionState>>,
     tunnel_metrics: Arc<RwLock<Option<TunnelMetrics>>>,
 }
 
@@ -86,9 +87,15 @@ struct DeviceStatePayload<'a> {
     tunnel_type: &'static str,
     interfaces: Vec<InterfaceInfo>,
     firewalls: BTreeMap<String, bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "tunnelStatsUpstream",
+        skip_serializing_if = "Option::is_none"
+    )]
     tunnel_stats_upstream: Option<TunnelStatsPayload>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "tunnelStatsDownstream",
+        skip_serializing_if = "Option::is_none"
+    )]
     tunnel_stats_downstream: Option<TunnelStatsPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pct: Option<f32>,
@@ -159,12 +166,12 @@ struct TunnelStatsPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     packets_lost: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    packets_retransmitted: Option<u64>,
+    packets_retrans: Option<u64>,
     bytes_sent: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_lost: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bytes_retransmitted: Option<u64>,
+    bytes_retrans: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -175,7 +182,22 @@ struct AppRamUsage {}
 
 impl DeviceStateReporter {
     pub async fn start(app_cfg: &AppConfig, always_on: bool) -> Result<Self> {
-        let registration = cloudflare::get_registration(&app_cfg.id, &app_cfg.access_token).await?;
+        let registration = match app_cfg.role {
+            TunnelRole::Client => {
+                cloudflare::get_registration(&app_cfg.id, &app_cfg.access_token).await?
+            }
+            TunnelRole::MeshNode => {
+                let identity = app_cfg.mesh_node.as_ref().ok_or_else(|| {
+                    anyhow!("Mesh node config is missing its account-scoped identity")
+                })?;
+                mesh::get_registration_config(
+                    &identity.account_tag,
+                    &app_cfg.id,
+                    &app_cfg.access_token,
+                )
+                .await?
+            }
+        };
         let account_id = registration.account.id.trim().to_string();
         if account_id.is_empty() {
             return Err(anyhow!(
@@ -211,7 +233,9 @@ impl DeviceStateReporter {
             client_version,
         };
 
-        let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+        // Report the real startup lifecycle: disconnected until MASQUE connects.
+        // Cloudflare Mesh activation observes this transition as well as H3 state.
+        let (state_tx, state_rx) = watch::channel(Some(ConnectionState::Disconnected));
         let tunnel_metrics = Arc::new(RwLock::new(None));
         tokio::spawn(run_reporter(cfg, state_rx, tunnel_metrics.clone()));
         Ok(Self {
@@ -222,16 +246,17 @@ impl DeviceStateReporter {
 
     pub fn connected(&self, handshake_latency: Duration) {
         let latency_ms = handshake_latency.as_millis().min(u128::from(u64::MAX)) as u64;
-        self.state_tx.send_replace(ConnectionState::Connected {
+        self.state_tx.send_replace(Some(ConnectionState::Connected {
             handshake_latency_ms: latency_ms,
-        });
+        }));
     }
 
     pub fn disconnected(&self) {
         if let Ok(mut metrics) = self.tunnel_metrics.write() {
             *metrics = None;
         }
-        self.state_tx.send_replace(ConnectionState::Disconnected);
+        self.state_tx
+            .send_replace(Some(ConnectionState::Disconnected));
     }
 
     pub fn update_tunnel_metrics(&self, sample: TunnelMetrics) {
@@ -243,7 +268,7 @@ impl DeviceStateReporter {
 
 async fn run_reporter(
     cfg: ReporterConfig,
-    mut state_rx: watch::Receiver<ConnectionState>,
+    mut state_rx: watch::Receiver<Option<ConnectionState>>,
     tunnel_metrics: Arc<RwLock<Option<TunnelMetrics>>>,
 ) {
     let client = Client::new();
@@ -255,6 +280,9 @@ async fn run_reporter(
         tokio::select! {
             _ = interval.tick() => {
                 let state = *state_rx.borrow();
+                let Some(state) = state else {
+                    continue;
+                };
                 let metrics = tunnel_metrics.read().ok().and_then(|value| *value);
                 let host = host_collector.sample(metrics.map(|sample| sample.local_ip));
                 report_current_state(&client, &cfg, state, metrics, host).await;
@@ -264,6 +292,9 @@ async fn run_reporter(
                     break;
                 }
                 let state = *state_rx.borrow_and_update();
+                let Some(state) = state else {
+                    continue;
+                };
                 let metrics = tunnel_metrics.read().ok().and_then(|value| *value);
                 let host = host_collector.sample(metrics.map(|sample| sample.local_ip));
                 report_current_state(&client, &cfg, state, metrics, host).await;
@@ -361,10 +392,10 @@ fn build_payload(
         rtt_var_us: sample.rtt_var_us,
         packets_sent: sample.packets_sent_upstream,
         packets_lost: Some(sample.packets_lost_upstream),
-        packets_retransmitted: Some(sample.packets_retransmitted_upstream),
+        packets_retrans: Some(sample.packets_retransmitted_upstream),
         bytes_sent: sample.bytes_sent_upstream,
         bytes_lost: Some(sample.bytes_lost_upstream),
-        bytes_retransmitted: Some(sample.bytes_retransmitted_upstream),
+        bytes_retrans: Some(sample.bytes_retransmitted_upstream),
     });
     let tunnel_stats_downstream = connected_metrics.map(|sample| TunnelStatsPayload {
         // QUIC RTT is a property of the bidirectional path, so the same
@@ -374,10 +405,10 @@ fn build_payload(
         rtt_var_us: sample.rtt_var_us,
         packets_sent: sample.packets_received_downstream,
         packets_lost: None,
-        packets_retransmitted: None,
+        packets_retrans: None,
         bytes_sent: sample.bytes_received_downstream,
         bytes_lost: None,
-        bytes_retransmitted: None,
+        bytes_retrans: None,
     });
 
     DeviceStatePayload {
@@ -473,7 +504,7 @@ mod tests {
         assert!(value.get("ram_used_pct").is_none());
         assert!(value.get("disk_read_bps").is_none());
         assert!(value["estimated_loss"].is_null());
-        assert!(value.get("tunnel_stats_upstream").is_none());
+        assert!(value.get("tunnelStatsUpstream").is_none());
     }
 
     #[test]
@@ -505,14 +536,12 @@ mod tests {
 
         assert_eq!(value["handshake_latency_ms"], 16);
         assert_eq!(value["estimated_loss"], 0.02);
-        assert_eq!(value["tunnel_stats_upstream"]["rtt_us"], 16_000);
-        assert_eq!(value["tunnel_stats_upstream"]["packets_lost"], 2);
-        assert_eq!(value["tunnel_stats_upstream"]["bytes_retransmitted"], 120);
-        assert_eq!(value["tunnel_stats_downstream"]["packets_sent"], 200);
-        assert_eq!(value["tunnel_stats_downstream"]["bytes_sent"], 20_000);
-        assert!(value["tunnel_stats_downstream"]
-            .get("packets_lost")
-            .is_none());
-        assert!(value["tunnel_stats_downstream"].get("bytes_lost").is_none());
+        assert_eq!(value["tunnelStatsUpstream"]["rtt_us"], 16_000);
+        assert_eq!(value["tunnelStatsUpstream"]["packets_lost"], 2);
+        assert_eq!(value["tunnelStatsUpstream"]["bytes_retrans"], 120);
+        assert_eq!(value["tunnelStatsDownstream"]["packets_sent"], 200);
+        assert_eq!(value["tunnelStatsDownstream"]["bytes_sent"], 20_000);
+        assert!(value["tunnelStatsDownstream"].get("packets_lost").is_none());
+        assert!(value["tunnelStatsDownstream"].get("bytes_lost").is_none());
     }
 }

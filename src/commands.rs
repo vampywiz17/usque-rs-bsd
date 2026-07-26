@@ -1,11 +1,12 @@
 use crate::api::cloudflare::{self, EnrollFailure};
 use crate::api::device_state::DeviceStateReporter;
 use crate::api::masque::{
-    maintain_native_tun, DatagramIoConfig, LifecycleHooks, MasqueConfig, PathMtuConfig,
-    QuicTransportConfig, ReconnectPolicy,
+    maintain_native_tun, CloudflareConnectProfile, DatagramIoConfig, LifecycleHooks, MasqueConfig,
+    PathMtuConfig, QuicTransportConfig, ReconnectPolicy,
 };
+use crate::api::mesh::{self, MeshNodeToken, CONNECTOR_REGISTRATION_PLATFORM};
 use crate::api::tunnel::TunnelDevice;
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, MeshNodeIdentity, TunnelRole};
 use crate::internal;
 use crate::models::{AccountData, DeviceIdentity, INVALID_PUBLIC_KEY};
 use crate::native_tun::{TunOptions, TunRsDevice, IPV6_MIN_MTU};
@@ -14,7 +15,7 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use p256::pkcs8::EncodePublicKey;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -33,11 +34,17 @@ pub enum Commands {
     /// Register a new client and enroll a MASQUE device key.
     /// Kept because it creates the config required by nativetun.
     Register(RegisterArgs),
+    /// Register this host as an optional Cloudflare Mesh node.
+    #[command(name = "mesh-register")]
+    MeshRegister(MeshRegisterArgs),
     /// Enroll or regenerate the MASQUE private key used by nativetun.
     Enroll(EnrollArgs),
     /// Expose WARP as a native TUN device using tun-rs.
     #[command(name = "nativetun")]
     NativeTun(NativeTunArgs),
+    /// Run a registered Mesh node without managing routes or firewall policy.
+    #[command(name = "mesh-node")]
+    MeshNode(NativeTunArgs),
     /// Print version information.
     Version,
 }
@@ -52,6 +59,26 @@ pub struct RegisterArgs {
     pub name: String,
     #[arg(long, default_value = "")]
     pub jwt: String,
+    #[arg(short = 'a', long)]
+    pub accept_tos: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MeshRegisterArgs {
+    /// Cloudflare-generated Mesh node token file (must be mode 0600 on Unix).
+    #[arg(long)]
+    pub token_file: PathBuf,
+    #[arg(short, long, default_value = internal::DEFAULT_LOCALE)]
+    pub locale: String,
+    #[arg(short, long, default_value = internal::DEFAULT_MODEL)]
+    pub model: String,
+    #[arg(short, long, default_value = "")]
+    pub name: String,
+    /// Acknowledge that Cloudflare currently accepts Mesh nodes only as Linux.
+    /// On FreeBSD this sends a documented "linux" compatibility claim and may
+    /// expose the account to unsupported-use enforcement.
+    #[arg(long)]
+    pub acknowledge_linux_platform_claim: bool,
     #[arg(short = 'a', long)]
     pub accept_tos: bool,
 }
@@ -169,11 +196,13 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Register(args) => register(&cli.config, args).await,
+        Commands::MeshRegister(args) => mesh_register(&cli.config, args).await,
         Commands::Enroll(args) => enroll(&cli.config, args).await,
         Commands::NativeTun(args) => native_tun(&cli.config, args).await,
+        Commands::MeshNode(args) => mesh_node(&cli.config, args).await,
         Commands::Version => {
             println!("usque-nativetun version: {}", env!("CARGO_PKG_VERSION"));
-            println!("Mode: native TUN only");
+            println!("Modes: native TUN client, optional route-neutral Mesh node");
             Ok(())
         }
     }
@@ -229,8 +258,75 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
     Ok(())
 }
 
+async fn mesh_register(config_path: &str, args: MeshRegisterArgs) -> Result<()> {
+    if Path::new(config_path).exists() {
+        return Err(anyhow!(
+            "refusing to overwrite existing config {config_path}; choose a separate Mesh config path"
+        ));
+    }
+    if !args.accept_tos {
+        println!(
+            "You must accept the Terms of Service (https://www.cloudflare.com/application/terms/) to register. Do you agree? (y/n): "
+        );
+        let mut response = String::new();
+        std::io::stdin()
+            .read_line(&mut response)
+            .context("failed to read user input")?;
+        if response.trim() != "y" {
+            return Err(anyhow!("user did not accept TOS"));
+        }
+    }
+    if !args.acknowledge_linux_platform_claim {
+        return Err(anyhow!(
+            "Cloudflare's Mesh node endpoint is Linux-only and rejects FreeBSD. Re-run with \
+             --acknowledge-linux-platform-claim only after reading README.md and LEGAL.md"
+        ));
+    }
+
+    let token = MeshNodeToken::read(&args.token_file)?;
+    let identity = internal::detect_device_identity(&args.name, &args.model, &args.locale);
+    let native_platform = identity.device_type.clone();
+    let mut registration_identity = identity.clone();
+    registration_identity.device_type = CONNECTOR_REGISTRATION_PLATFORM.to_string();
+    tracing::warn!(
+        "Cloudflare rejected FreeBSD Mesh registration; sending the explicitly acknowledged \
+         compatibility platform claim '{}' for actual platform '{}'. Cloudflare may suspend or terminate service for unsupported use",
+        CONNECTOR_REGISTRATION_PLATFORM, native_platform
+    );
+    tracing::info!(
+        "Registering Mesh node '{}' (actual OS {} {}, client {})",
+        identity.name,
+        native_platform,
+        identity.os_version,
+        identity.client_version
+    );
+    let (private_key_der, public_key_der) = internal::generate_ec_key_pair()?;
+    let account = mesh::register(&token, &registration_identity, &public_key_der).await?;
+    tracing::info!("Enrolling the Mesh MASQUE key through Cloudflare's registration contract");
+    let enrolled = enroll_or_fail(&account, &public_key_der, &registration_identity).await?;
+    let mut app_cfg = build_app_config(&enrolled, &private_key_der, &account.token, identity)?;
+    app_cfg.role = TunnelRole::MeshNode;
+    app_cfg.mesh_node = Some(MeshNodeIdentity {
+        account_tag: token.account_tag().to_string(),
+        tunnel_id: token.tunnel_id().to_string(),
+        native_platform,
+        registration_platform_claim: CONNECTOR_REGISTRATION_PLATFORM.to_string(),
+    });
+    app_cfg.save_sensitive(config_path)?;
+    tracing::info!("Mesh node config saved to {config_path} with owner-only permissions");
+    tracing::info!(
+        "No routes or firewall rules were created; FreeBSD/OPNsense policy remains administrator-owned"
+    );
+    Ok(())
+}
+
 async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
     let mut cfg = AppConfig::load(config_path)?;
+    if cfg.role != TunnelRole::Client {
+        return Err(anyhow!(
+            "the enroll command only supports client configs; Mesh nodes must be registered with mesh-register"
+        ));
+    }
     let account = AccountData {
         id: cfg.id.clone(),
         token: cfg.access_token.clone(),
@@ -294,7 +390,34 @@ async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
 }
 
 async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
+    run_tunnel(config_path, args, TunnelRole::Client).await
+}
+
+async fn mesh_node(config_path: &str, args: NativeTunArgs) -> Result<()> {
+    run_tunnel(config_path, args, TunnelRole::MeshNode).await
+}
+
+async fn run_tunnel(
+    config_path: &str,
+    args: NativeTunArgs,
+    requested_role: TunnelRole,
+) -> Result<()> {
     let cfg = AppConfig::load(config_path)?;
+    if cfg.role != requested_role {
+        return Err(anyhow!(
+            "config role is '{}', but the selected command requires '{}'",
+            cfg.role,
+            requested_role
+        ));
+    }
+    if requested_role == TunnelRole::MeshNode && cfg.mesh_node.is_none() {
+        return Err(anyhow!("Mesh node config is missing its node identity"));
+    }
+    if requested_role == TunnelRole::MeshNode {
+        tracing::info!(
+            "Mesh node mode selected; routes, forwarding and firewall policy remain under FreeBSD/OPNsense administrator control"
+        );
+    }
     if !args.interface_name.is_empty() {
         internal::check_ifname(&args.interface_name)?;
     }
@@ -339,8 +462,16 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
 
     let device_state = match DeviceStateReporter::start(&cfg, args.always_reconnect).await {
         Ok(reporter) => {
-            tracing::info!("Cloudflare device-state reporting enabled (TunnelOnly/MASQUE)");
+            tracing::info!(
+                role = %requested_role,
+                "Cloudflare device-state reporting enabled with truthful FreeBSD/MASQUE data"
+            );
             Some(reporter)
+        }
+        Err(err) if requested_role == TunnelRole::MeshNode => {
+            return Err(err).context(
+                "Mesh registration validation failed; register a fresh node instead of starting an untracked Edge session",
+            );
         }
         Err(err) => {
             tracing::warn!(
@@ -370,27 +501,38 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
     .context("failed to create native tun-rs TUN device. Are you root/administrator?")?;
 
     tracing::info!("Created TUN device: {}", tun.name());
+    let (hook_mode, user_agent_role) = match requested_role {
+        TunnelRole::Client => ("nativetun", "TunnelOnly"),
+        TunnelRole::MeshNode => ("mesh-node", "MeshNode"),
+    };
+    let client_version = if cfg.device_identity.client_version.is_empty() {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        &cfg.device_identity.client_version
+    };
+    let user_agent =
+        format!("usque-nativetun/{client_version} (FreeBSD; {user_agent_role}; MASQUE)");
 
     let hook_env = HashMap::from([
-        ("USQUE_MODE".to_string(), "nativetun".to_string()),
+        ("USQUE_MODE".to_string(), hook_mode.to_string()),
         ("USQUE_IFACE".to_string(), tun.name().to_string()),
         ("USQUE_IPV4".to_string(), cfg.ipv4.clone()),
         ("USQUE_IPV6".to_string(), cfg.ipv6.clone()),
     ]);
 
+    let connect_profile = match requested_role {
+        TunnelRole::Client => CloudflareConnectProfile::Client,
+        TunnelRole::MeshNode => CloudflareConnectProfile::MeshNode {
+            client_version: client_version.to_string(),
+        },
+    };
     let masque = MasqueConfig {
         private_key: cfg.get_ec_private_key()?,
         sni: args.sni_address,
         insecure: args.insecure,
         endpoints,
-        user_agent: if cfg.device_identity.client_version.is_empty() {
-            internal::client_user_agent()
-        } else {
-            format!(
-                "usque-nativetun/{} (FreeBSD; TunnelOnly; MASQUE)",
-                cfg.device_identity.client_version
-            )
-        },
+        user_agent,
+        connect_profile,
         quic: QuicTransportConfig {
             keepalive_period: args.keepalive_period,
             initial_packet_size: args.initial_packet_size,
@@ -418,7 +560,7 @@ async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
         },
         reconnect: ReconnectPolicy {
             delay: args.reconnect_delay,
-            always: args.always_reconnect,
+            always: maintain_edge_session(requested_role, args.always_reconnect),
         },
         hooks: LifecycleHooks {
             on_connect: non_empty(args.on_connect),
@@ -454,6 +596,8 @@ fn build_app_config(
         .first()
         .ok_or_else(|| anyhow!("Cloudflare response did not contain a peer config"))?;
     Ok(AppConfig {
+        role: TunnelRole::Client,
+        mesh_node: None,
         private_key: general_purpose::STANDARD.encode(private_key_der),
         endpoint_v4: config::endpoint_v4_from_account_value(&peer.endpoint.v4),
         endpoint_v6: config::endpoint_v6_from_account_value(&peer.endpoint.v6),
@@ -477,6 +621,10 @@ fn build_app_config(
             })
             .collect(),
     })
+}
+
+fn maintain_edge_session(role: TunnelRole, always_reconnect: bool) -> bool {
+    always_reconnect || role == TunnelRole::MeshNode
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -510,4 +658,22 @@ fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
         .parse::<u64>()
         .map(Duration::from_secs)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maintain_edge_session;
+    use crate::config::TunnelRole;
+
+    #[test]
+    fn mesh_node_always_maintains_an_edge_session() {
+        assert!(maintain_edge_session(TunnelRole::MeshNode, false));
+        assert!(maintain_edge_session(TunnelRole::MeshNode, true));
+    }
+
+    #[test]
+    fn client_preserves_on_demand_reconnect_policy() {
+        assert!(!maintain_edge_session(TunnelRole::Client, false));
+        assert!(maintain_edge_session(TunnelRole::Client, true));
+    }
 }

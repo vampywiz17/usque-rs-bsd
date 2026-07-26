@@ -19,6 +19,7 @@ read the [legal and interoperability notice](LEGAL.md), the maintained
 - Native TUN mode only
 - FreeBSD as the primary target
 - Cloudflare registration and MASQUE key enrollment
+- Optional, experimental and unsupported FreeBSD Mesh node mode
 - Stable FreeBSD device identity and MASQUE-native registration metadata
 - Cloudflare device orchestration status for TunnelOnly/MASQUE sessions
 - QUIC/HTTP/3 MASQUE `cf-connect-ip` tunnel
@@ -45,6 +46,7 @@ bug fix that is not present upstream.
 | Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
+| Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow and automatic route-independent Edge-session maintenance; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
 | Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks |
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
@@ -54,7 +56,10 @@ The project deliberately remains tunnel-only. It does not take ownership of
 routes, DNS, firewall policy, proxying or split-tunnel rules; those belong to
 the FreeBSD host and, in the intended deployment, OPNsense. Compatibility work
 aims to use standards-compliant Cloudflare, quiche and `tun-rs` behavior with
-truthful metadata, not to impersonate another operating system or client.
+truthful runtime identity and telemetry. The experimental Mesh enrollment
+exception is documented separately below: it claims `linux` only because the
+Connector endpoint rejects FreeBSD, never claims to be an official client, and
+requires explicit operator acknowledgement.
 
 ## FreeBSD build
 
@@ -103,14 +108,104 @@ RUST_LOG=info ./target/release/usque-nativetun nativetun \
 
 The application configures interface addresses and MTU, but does not manage the system's routing policy. Routes must be configured separately for the intended setup.
 
+## Experimental Mesh node mode: unsupported platform warning
+
+> [!CAUTION]
+> Cloudflare documents Mesh nodes for specific Linux distributions only. Its
+> Connector enrollment endpoint rejected the truthful `freebsd` value with
+> `invalid device operating system for warp connector device registration`.
+> This experimental mode therefore sends the platform value `linux` during
+> enrollment even though the host is FreeBSD. This is a deliberate compatibility
+> claim, not a statement that the host is Linux and not a claim that this
+> project is an official Cloudflare client.
+
+This exception may violate Cloudflare terms, an account agreement, policy or
+future enforcement rule. Cloudflare may detect the mismatch and may reject the
+registration, disable the node, restrict or suspend service, revoke credentials,
+or suspend or terminate the associated account without notice. The operator
+accepts all such risk. To the maximum extent permitted by applicable law, the
+authors and contributors accept no liability for account sanctions, loss of
+service, loss of data, financial loss, business interruption or any other
+consequence caused by enabling or using this mode. Read [LEGAL.md](LEGAL.md)
+before proceeding.
+
+The registration command refuses to continue without the long, explicit
+acknowledgement flag. Keep the dashboard-generated token outside the repository
+and owner-readable only:
+
+```sh
+chmod 600 /home/freebsd/mesh-node.token
+
+./target/release/usque-nativetun \
+  --config /home/freebsd/mesh-node.json \
+  mesh-register \
+  --token-file /home/freebsd/mesh-node.token \
+  --accept-tos \
+  --acknowledge-linux-platform-claim
+```
+
+Run the separately registered node with the optional `mesh-node` command:
+
+```sh
+sudo ./target/release/usque-nativetun \
+  --config /home/freebsd/mesh-node.json \
+  mesh-node \
+  --interface-name tun1
+```
+
+Mesh mode always establishes and maintains its Cloudflare Edge session, even
+when no route has produced an initial TUN packet. This is intentional connector
+lifecycle behavior and does not add or alter any route. `--always-reconnect`
+remains optional for client mode and is redundant in Mesh mode.
+
+The runtime MASQUE user agent remains truthful
+(`usque-nativetun/<version> (FreeBSD; MeshNode; MASQUE)`). The generated
+configuration records both `native_platform: "FreeBSD"` and
+`registration_platform_claim: "linux"`; it does not retain the Connector
+token or tunnel secret. Both roles use the same truthful device-state reporter
+for observed lifecycle, host and quiche metrics. Mesh adds the Connector-only
+`POST /h3-stats` request on the existing HTTP/3 connection every 15 seconds.
+
+Mesh startup performs one authenticated account-scoped registration/config
+read. A rejected or expired registration stops startup instead of creating an
+untracked Edge session. No synthetic inner traffic is generated.
+
+> [!WARNING]
+> Current Mesh status: experimental and incomplete. Authorized tests confirm
+> successful Connector enrollment, a registered Device with the Cloudflare
+> Mesh Network Profile, assigned Mesh IPv4/IPv6 addresses, an established
+> MASQUE session, and accepted truthful device-state and `/h3-stats` reports.
+> However, the account-scoped WARP Connector connections API does not list the
+> session, so the Mesh dashboard remains `Down`. A prior `Online` observation
+> was not reproducible. This project does not claim that the current Mesh mode
+> is a supported or production-ready Cloudflare Mesh connector.
+
+### Deployment roles
+
+1. `nativetun` is the egress role. OPNsense may route selected LAN traffic
+   into this TUN so clients behind the firewall reach the Internet through
+   Cloudflare.
+2. `mesh-node` is the ingress role. OPNsense may publish selected internal
+   networks so authorized remote Cloudflare Mesh devices can reach them through
+   this TUN.
+
+The roles use separate configuration files and interface names, and may run
+simultaneously. The program creates and configures each TUN interface only. It
+never creates Cloudflare routes, FreeBSD routes, forwarding policy, NAT or
+firewall rules. Those remain the explicit responsibility of the FreeBSD
+administrator or a future OPNsense plugin. Legacy client configurations remain
+compatible.
+
 ## Cloudflare device monitoring
 
-Native TUN mode uses Cloudflare's separate, out-of-tunnel HTTPS orchestration
-connection to report the real MASQUE session lifecycle. It sends an immediate
-update on connect/disconnect and a 60-second heartbeat while running, using
-`Connected`/`Disconnected`, `tunnel_only` and `masque` values from the current
-Cloudflare One Client device-state contract. Reporting failures are logged but
-never terminate or reconnect the QUIC tunnel.
+Both the `nativetun` egress role and the `mesh-node` ingress role use
+Cloudflare's separate, out-of-tunnel HTTPS orchestration connection to report
+their real MASQUE session lifecycle. They send updates for observed
+connect/disconnect events and a 60-second heartbeat, using
+`Connected`/`Disconnected`, `tunnel_only` and `masque` values from the
+current Cloudflare One Client device-state contract. A Mesh registration or
+authorization failure stops Mesh startup; later reporting failures are logged
+but never terminate or reconnect a healthy QUIC tunnel.
 
 Each heartbeat reports cumulative packet, byte, loss, retransmission and RTT
 statistics directly from quiche's active QUIC path. Native FreeBSD collectors use
@@ -203,6 +298,16 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   registration workflow was inherited from the MIT-licensed upstream
   `usque-rs` project and subsequently adapted here for current MASQUE enrollment
   and truthful FreeBSD metadata; this port did not originate that workflow.
+- Mesh registration uses the Connector token and account-specific
+  `/v1/accounts/{account_tag}/warp_connector` enrollment contract, decodes both
+  direct and Cloudflare `result` response envelopes, then fetches the generated
+  tunnel configuration through
+  `/v1/accounts/{account_tag}/reg/{registration_id}` with the registration
+  bearer token. The request uses P-256 MASQUE keys and actual host name, model,
+  OS version and stable serial, but sends `type: "linux"` because Cloudflare
+  rejects FreeBSD for this Linux-only resource. This isolated exception requires
+  explicit CLI acknowledgement, is persisted as metadata in the Mesh config and
+  is never reused for the runtime user agent or client telemetry.
 - The default orchestration SNI is `api.devices.cloudflare.com`, used by
   Cloudflare One Client 2026.6 and later. The compatible registration path
   remains configurable with `USQUE_API_URL` and `USQUE_API_VERSION` because
@@ -269,26 +374,33 @@ client endpoints. Publication of this repository does not grant users any
 license to Cloudflare's proprietary software, services, APIs, trademarks or
 other intellectual property. The project does not bypass authentication,
 authorization, service limits, account restrictions or technical protection
-measures, and it will not treat a Cloudflare block or restriction as something
-to circumvent. See [LEGAL.md](LEGAL.md) for the complete notice.
+measures. The sole platform exception is the prominently disclosed
+`linux` value used for optional FreeBSD Mesh enrollment after explicit
+operator acknowledgement; it must not be used to evade any further Cloudflare
+block or enforcement action. See [LEGAL.md](LEGAL.md) for the complete notice.
 
 This project implements properties of Cloudflare's clients and wire contracts
 only where they are required for protocol compatibility, interoperability and
 connection stability. It is not intended to be indistinguishable from an
-official client and does not attempt to conceal its identity. In particular,
-device-state and monitoring data sent to Cloudflare are truthful: the client
-identifies the platform as FreeBSD, uses this project's own version identity,
-and derives connection status, tunnel mode, tunnel type, colocation, latency
-and loss data from the real system and MASQUE session state. It does not
-fabricate telemetry or report itself as an official Cloudflare client.
-Cloudflare can distinguish and restrict this implementation at any time.
+official client and does not attempt to conceal its identity. Device-state and
+monitoring data sent by both roles are truthful: each identifies the platform
+as FreeBSD, uses this project's own version identity, and derives values from
+the real system and MASQUE session. Mesh additionally reports the real quiche
+path statistics required by its Connector session. Only the Mesh enrollment
+platform field is the documented `linux` compatibility claim described above;
+that value is not reused as runtime identity or telemetry. The project never
+reports itself as an official Cloudflare client. Cloudflare can distinguish and
+restrict this implementation at any time.
 
 This software is provided as-is, without warranties or guarantees. Its authors
-are not responsible for account sanctions, service interruption, data loss, or
-damage to systems or networks resulting from its use. Although the project is
-developed with security in mind, it is an independent hobby and research
-project, not a professionally audited security product. Use it at your own
-risk.
+and contributors are not responsible, to the maximum extent permitted by
+applicable law, for account warnings, credential revocation, node disabling,
+service restrictions, suspension or termination, service interruption, data
+loss, financial loss, business interruption, or damage to systems or networks
+resulting from use of the software or the Mesh platform compatibility claim.
+Although the project is developed with security in mind, it is an independent
+hobby and research project, not a professionally audited security product. Use
+it entirely at your own risk.
 
 Responsible security reports are welcome. Please open an issue containing only
 your contact details and a brief, non-sensitive summary so that the full

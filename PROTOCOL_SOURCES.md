@@ -5,7 +5,7 @@ undocumented interoperability behavior. It should be updated whenever a new
 endpoint, request field, protocol extension or official-client behavior is
 implemented.
 
-Last reviewed against the linked public sources: 2026-07-25.
+Last reviewed against the linked public sources: 2026-07-26.
 
 "Documented" means that a public source describes the relevant behavior. It
 does not mean that Cloudflare supports this third-party client. "Observed"
@@ -27,6 +27,10 @@ not mean that Cloudflare has authorized the resulting integration.
 | Cloudflare-specific `cf-connect-ip` request values | Inherited interoperability behavior | Present in the imported native MASQUE implementation and used only to establish the CONNECT-IP tunnel. Standards-compliant HTTP/3 and capsule handling remain delegated to `quiche`. |
 | Device-state endpoint and payload | Observed undocumented interoperability behavior | Inferred from network traffic produced by an official client on the maintainer's authorized account/device, compared with that account's dashboard and public Cloudflare device models. Added by this FreeBSD port; not copied from Cloudflare source code and not represented as a public or supported API. |
 | FreeBSD telemetry values | Locally measured | Derived from native FreeBSD interfaces and the active `quiche` connection. Missing measurements are omitted and official-client identity or values are not fabricated. |
+| Mesh resource provisioning | Public Cloudflare documentation and management API | Cloudflare's [Mesh get-started guide](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-mesh/get-started/) documents Connector creation, token provisioning and Linux-only supported operating systems. The [WARP Connector API](https://developers.cloudflare.com/api/resources/zero_trust/subresources/tunnels/subresources/warp_connector/) documents the account-scoped management resource. |
+| Mesh Connector enrollment and config retrieval | Observed undocumented interoperability behavior with one disclosed platform exception | The account-scoped POST `/v1/accounts/{account_tag}/warp_connector`, compact Base64 token fields, Cloudflare `result` response envelope, and subsequent authenticated GET `/v1/accounts/{account_tag}/reg/{registration_id}?dex_tests_version=1` were independently inferred and validated during authorized use. Clean-room inspection of endpoint symbols and wire behavior from the SHA256-verified official Linux package `cloudflare-warp 2026.6.880.0` was used only to identify protocol facts; the temporary package was removed and no official source or binary code is included. A minimized request with truthful `freebsd` was rejected as an invalid Connector operating system. The optional implementation therefore sends `type: "linux"` only after explicit operator acknowledgement while preserving truthful FreeBSD runtime identity and local audit metadata. |
+| Mesh data plane | Public standards and existing public-library path | Uses the same RFC 9484 CONNECT-IP, HTTP/3 DATAGRAM, `quiche` and `tun-rs` implementation as client mode. It adds no proprietary framing and deliberately leaves routes, forwarding, NAT and firewall policy to the administrator. |
+| Mesh lifecycle and H3 path statistics | Observed Connector control behavior with public library measurements | Authorized comparison showed that a Mesh device uses the shared device-state lifecycle and `POST /h3-stats` on the existing H3 session at a 15-second cadence. Device and host values come from the same truthful FreeBSD/quiche collectors as client mode. The schema-version string and cumulative Connector values are serialized from quiche's active path statistics; response bodies are drained for H3 flow control but are neither interpreted nor logged. These accepted reports do not currently establish the undocumented edge association required for the WARP Connector connections API: the registered Device and data-plane session are observable, but the Mesh dashboard remains `Down`. |
 
 ## Development rules for undocumented behavior
 
@@ -41,9 +45,13 @@ Changes involving undocumented behavior must satisfy all of the following:
 5. No proprietary source or binary code, confidential document, credential,
    private key, reusable token, personal traffic capture or extracted asset is
    committed.
-6. Values sent to Cloudflare describe this client and the real host/session;
-   they must not impersonate an official client or another device.
-7. An explicit Cloudflare restriction or block must not be circumvented.
+6. Values sent to Cloudflare describe this client and the real host/session and
+   must not impersonate an official client or another device. The sole exception
+   is the documented, opt-in Mesh enrollment platform claim; actual FreeBSD
+   identity remains recorded and truthful at runtime.
+7. Authentication, authorization and later enforcement blocks must not be
+   circumvented. The Linux-only Mesh platform claim is the sole documented
+   compatibility exception and must never be expanded into identity evasion.
 
 Where a public standard or documented Cloudflare API can replace observed
 behavior, the public mechanism is preferred. A public response model may be

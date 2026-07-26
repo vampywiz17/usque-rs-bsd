@@ -9,8 +9,43 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelRole {
+    #[default]
+    Client,
+    MeshNode,
+}
+
+impl std::fmt::Display for TunnelRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client => f.write_str("client"),
+            Self::MeshNode => f.write_str("mesh-node"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MeshNodeIdentity {
+    pub account_tag: String,
+    pub tunnel_id: String,
+    /// Actual operating system observed by this program.
+    #[serde(default)]
+    pub native_platform: String,
+    /// Platform value required by Cloudflare's Linux-only Connector endpoint.
+    #[serde(default)]
+    pub registration_platform_claim: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
+    /// Explicit tunnel role. Missing values in legacy files deserialize as
+    /// client, preserving the original native-TUN behavior.
+    #[serde(default)]
+    pub role: TunnelRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_node: Option<MeshNodeIdentity>,
     pub private_key: String,
     pub endpoint_v4: String,
     pub endpoint_v6: String,
@@ -56,6 +91,19 @@ impl AppConfig {
     pub fn save(&self, path: &str) -> Result<()> {
         let raw = serde_json::to_string_pretty(self).context("failed to encode config")?;
         fs::write(path, raw).with_context(|| format!("failed to write config file {path}"))
+    }
+
+    /// Save credential-bearing configuration and restrict it to its owner.
+    pub fn save_sensitive(&self, path: &str) -> Result<()> {
+        self.save(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+                format!("failed to restrict config file permissions for {path}")
+            })?;
+        }
+        Ok(())
     }
 
     pub fn get_ec_private_key(&self) -> Result<SecretKey> {
@@ -274,6 +322,48 @@ mod tests {
                 "192.0.2.30:443".parse().unwrap(),
                 "192.0.2.40:443".parse().unwrap(),
             ]
+        );
+    }
+    #[test]
+    fn legacy_config_defaults_to_client_role() {
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{
+                "private_key":"",
+                "endpoint_v4":"",
+                "endpoint_v6":"",
+                "endpoint_pub_key":"",
+                "id":"",
+                "access_token":"",
+                "ipv4":"",
+                "ipv6":""
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.role, TunnelRole::Client);
+        assert!(cfg.mesh_node.is_none());
+    }
+
+    #[test]
+    fn mesh_role_round_trips_without_token_material() {
+        let cfg = AppConfig {
+            role: TunnelRole::MeshNode,
+            mesh_node: Some(MeshNodeIdentity {
+                account_tag: "a".repeat(32),
+                tunnel_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                native_platform: "FreeBSD".to_string(),
+                registration_platform_claim: "linux".to_string(),
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&cfg).unwrap();
+        let decoded: AppConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.role, TunnelRole::MeshNode);
+        assert_eq!(decoded.mesh_node, cfg.mesh_node);
+        assert!(!encoded.contains("tunnel_secret"));
+        assert!(!encoded.contains("warp_connector_token"));
+        assert_eq!(
+            decoded.mesh_node.unwrap().registration_platform_claim,
+            "linux"
         );
     }
 }

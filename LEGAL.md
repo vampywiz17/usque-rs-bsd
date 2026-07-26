@@ -14,8 +14,12 @@ Cloudflare to use undocumented client endpoints or wire contracts.
 The fact that an endpoint accepts a request does not make that endpoint public,
 documented, supported or authorized for third-party use. Cloudflare may change,
 restrict, rate-limit, block or discontinue any behavior used by this project at
-any time. This project will not treat an explicit technical, account-level or
-legal restriction imposed by Cloudflare as something to circumvent.
+any time. The experimental FreeBSD Mesh mode contains one narrow and prominent
+exception: after explicit operator acknowledgement, enrollment sends
+`type: "linux"` because the Connector endpoint rejects `freebsd`. This does
+not create Cloudflare authorization and must not be used to evade authentication,
+account controls, service limits or any later block or enforcement action. No
+other explicit Cloudflare restriction is treated as something to circumvent.
 
 ## Independent implementation and provenance
 
@@ -54,8 +58,9 @@ authorized to add such material. The detailed source classification is kept in
 ## Interoperability scope
 
 Undocumented protocol details are implemented only for connection setup,
-interoperability, truthful device registration, truthful connection-state
-reporting and operation of the native tunnel. The project does not seek access
+interoperability, device registration, truthful connection-state reporting and
+operation of the native tunnel. The sole departure from truthful platform
+registration is the explicitly disclosed experimental Mesh exception below.
 to other users' accounts, registrations, devices or network resources.
 
 Users must authenticate with credentials they are authorized to use for the
@@ -78,14 +83,52 @@ Relevant Cloudflare terms and policies include:
 - <https://www.cloudflare.com/service-specific-terms-zero-trust-services/>
 - <https://www.cloudflare.com/trademark/>
 
+## Experimental FreeBSD Mesh platform claim
+
+Cloudflare's public Mesh documentation lists Linux distributions for Mesh
+nodes. During an authorized compatibility test, the Connector enrollment
+endpoint explicitly rejected the truthful value `freebsd` as an invalid device
+operating system. The optional Mesh mode therefore sends `type: "linux"` in
+that enrollment request only, after the operator supplies the long
+`--acknowledge-linux-platform-claim` flag.
+
+The actual system remains FreeBSD. Its real host name, model, OS version and
+stable project-generated serial are used; the generated configuration records
+both `native_platform: "FreeBSD"` and
+`registration_platform_claim: "linux"`. The runtime identifies this project
+and FreeBSD in its MASQUE user agent. Mesh device-state and host telemetry uses
+the same truthful measurements as client mode, plus actual Connector path
+statistics. The project does not claim to be an official client.
+
+This workaround is unsupported and is not Cloudflare permission, approval or
+consent. It may violate Cloudflare terms, policies, an account agreement or a
+future enforcement rule. The acknowledgement flag records only the operator's
+informed choice; it does not waive Cloudflare's rights or make the use lawful or
+contractually permitted. Operators should obtain independent legal advice or
+Cloudflare permission where appropriate.
+
+Cloudflare may detect the mismatch and may reject registration, disable or
+remove the node, revoke credentials, restrict or terminate service, or suspend
+or terminate the associated account, potentially without notice. The program
+does not retry with alternative identities to evade rejection and must not be
+modified to bypass any subsequent block. The operator assumes the full risk of
+service loss, account sanctions, data loss, financial loss and business
+interruption arising from this optional mode.
+
 ## Telemetry and privacy
 
 Device-state reporting sends actual connection and host measurements to the
-Cloudflare account with which the client is registered. Depending on platform
-support, this can include device identity fields, interface addresses and
-counters, network throughput, CPU and memory utilization, filesystem usage,
+Cloudflare account with which either tunnel role is registered. Depending on
+platform support, this can include device identity fields, interface addresses
+and counters, network throughput, CPU and memory utilization, filesystem usage,
 QUIC latency, loss, packets and bytes. Unsupported or unavailable measurements
 are omitted rather than invented.
+
+Client and Mesh telemetry use the same truthful FreeBSD host and MASQUE
+measurements. Mesh additionally sends real quiche path statistics on its
+established H3 session. The isolated Linux enrollment value described above is
+registration compatibility metadata, not telemetry, and is never reused as a
+runtime platform or official-client identity.
 
 Operators are responsible for giving any required notice to affected users and
 for ensuring that collection and transmission of device data is permitted by
@@ -100,9 +143,11 @@ only to identify the services and protocols with which this independent project
 interoperates. No Cloudflare logo is distributed by this project.
 
 The client uses its own project name and version identity and reports FreeBSD
-as FreeBSD. It is not intended to be indistinguishable from an official client
-and must not claim official-client status, endorsement, certification or
-support.
+as FreeBSD at runtime. The sole exception is the disclosed Linux platform value
+used during optional Mesh enrollment. That value is not reused as an
+official-client identity, runtime platform or telemetry value. The project is
+not intended to be indistinguishable from an official client and must not claim
+official-client status, endorsement, certification or support.
 
 ## License, warranty and responsibility
 
@@ -114,8 +159,18 @@ permitted by applicable law; it does not bind Cloudflare or prevent Cloudflare
 from enforcing its own rights, agreements or service restrictions.
 
 Users remain solely responsible for their deployment, routing, credentials,
-traffic, account compliance and legal obligations. No availability,
-compatibility, performance, security or continued service access is promised.
+traffic, account compliance, contractual compliance and legal obligations. No
+availability, compatibility, performance, security or continued service access
+is promised.
+
+To the maximum extent permitted by applicable law, the authors, maintainers and
+contributors accept no liability for warnings, registration rejection, node
+removal, credential revocation, service restriction, suspension or termination,
+account suspension or termination, service interruption, data loss, financial
+loss, business interruption, reputational harm, or any direct, indirect,
+incidental, special, exemplary or consequential loss arising from the Mesh
+platform claim or other use of this software. This notice cannot exclude
+liability that mandatory law does not permit to be excluded.
 
 Contributions are accepted only under the provenance and rights certifications
 in [`CONTRIBUTING.md`](CONTRIBUTING.md). Security concerns should be reported

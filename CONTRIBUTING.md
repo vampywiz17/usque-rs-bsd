@@ -1,7 +1,8 @@
 # Contributing
 
 Contributions are welcome when they preserve the project's tunnel-only scope,
-standards compliance, truthful identity and documented provenance.
+standards compliance, truthful runtime identity, the narrowly disclosed Mesh
+platform exception and documented provenance.
 
 Read [`LEGAL.md`](LEGAL.md) and [`PROTOCOL_SOURCES.md`](PROTOCOL_SOURCES.md)
 before submitting a change involving Cloudflare behavior, registration,
@@ -52,12 +53,20 @@ official-client behavior must:
 4. state why undocumented behavior is necessary;
 5. use only accounts, devices and credentials the researcher is authorized to
    use;
-6. report this project's real platform, version and measured values; and
+6. report this project's real platform, version and measured values, except for
+   the single documented and explicitly acknowledged Mesh enrollment claim; and
 7. include tests appropriate to the affected wire contract and failure path.
 
 Public standards and documented APIs are preferred whenever they can provide
 the required behavior. Do not work around an explicit Cloudflare block,
 restriction or withdrawal of access.
+
+Do not broaden or conceal the Mesh `type: "linux"` exception. Mesh changes
+must preserve the explicit acknowledgement, the real FreeBSD identity in local
+audit metadata, runtime identification and all device telemetry. Shared client
+and Mesh metrics must come from the same truthful collectors; Mesh-only control
+data must come from the real Connector session. A later Cloudflare rejection or
+block must stop the operation rather than trigger identity fallback or evasion.
 
 ## Engineering requirements
 
