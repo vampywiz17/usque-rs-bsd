@@ -96,6 +96,7 @@ pub struct MasqueConfig {
     pub io: DatagramIoConfig,
     pub reconnect: ReconnectPolicy,
     pub hooks: LifecycleHooks,
+    pub activation_probe: Option<Vec<u8>>,
     pub device_state: Option<DeviceStateReporter>,
 }
 
@@ -433,6 +434,41 @@ async fn run_tunnel_session(
     let stats = Stats::new();
     let stats_handle = spawn_stats_task(stats.clone(), Instant::now());
     let flow_prefix = build_flow_prefix(flow_id)?;
+
+    if let Some(mut packet) = cfg.activation_probe.clone() {
+        let probe_result: Result<bool> = async {
+            let queued = send_packet_datagram(
+                &socket,
+                endpoint,
+                local_addr,
+                &mut conn,
+                &flow_prefix,
+                &mut packet,
+                &stats,
+                dev,
+                &mut buf,
+                &mut udp_batch,
+            )
+            .await?;
+            if queued {
+                udp_batch.flush_quic(&socket, &mut conn).await?;
+            }
+            Ok(queued)
+        }
+        .await;
+
+        match probe_result {
+            Ok(true) => tracing::info!(
+                "Mesh activation probe queued through the established CONNECT-IP session"
+            ),
+            Ok(false) => tracing::warn!(
+                "Mesh activation probe was not queued; the established tunnel will continue"
+            ),
+            Err(err) => tracing::warn!(
+                "Mesh activation probe failed; the established tunnel will continue: {err:#}"
+            ),
+        }
+    }
 
     if let Some(mut pkt) = pending_pkt.take() {
         send_packet_datagram(
@@ -1028,7 +1064,7 @@ async fn send_packet_datagram(
     dev: &Arc<TunRsDevice>,
     buf: &mut [u8],
     udp_batch: &mut UdpBatchIo,
-) -> Result<()> {
+) -> Result<bool> {
     match packet::prepare_outgoing(pkt) {
         Ok(_) => {
             let pkt_len = pkt.len() as u64;
@@ -1047,7 +1083,7 @@ async fn send_packet_datagram(
                     if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, dev.current_mtu()) {
                         let _ = dev.send_packet(&icmp_pkt).await;
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
             }
 
@@ -1062,12 +1098,12 @@ async fn send_packet_datagram(
                         Ok(()) => {
                             stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                             stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
-                            return Ok(());
+                            return Ok(true);
                         }
                         Err(e) => {
                             stats.dropped.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!("datagram send_buf error: {e}; dropping packet");
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 }
@@ -1108,12 +1144,12 @@ async fn send_packet_datagram(
             tracing::trace!(
                 "datagram send queue stayed full after backpressure retries, dropping packet"
             );
-            Ok(())
+            Ok(false)
         }
         Err(e) => {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::trace!("dropping outgoing packet: {e}");
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -1132,7 +1168,8 @@ mod tests {
 
     #[test]
     fn client_connect_profile_preserves_existing_headers() {
-        let headers = connect_request_headers(&CloudflareConnectProfile::Client, "usque-test", false);
+        let headers =
+            connect_request_headers(&CloudflareConnectProfile::Client, "usque-test", false);
         assert_eq!(header_value(&headers, b":scheme"), Some(&b"https"[..]));
         assert_eq!(
             header_value(&headers, b"capsule-protocol"),

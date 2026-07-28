@@ -1,5 +1,6 @@
 use crate::api::cloudflare::{self, EnrollFailure};
 use crate::api::device_state::DeviceStateReporter;
+use crate::api::icmp;
 use crate::api::masque::{
     maintain_native_tun, CloudflareConnectProfile, DatagramIoConfig, LifecycleHooks, MasqueConfig,
     PathMtuConfig, QuicTransportConfig, ReconnectPolicy,
@@ -15,6 +16,7 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use p256::pkcs8::EncodePublicKey;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -309,6 +311,7 @@ async fn mesh_register(config_path: &str, args: MeshRegisterArgs) -> Result<()> 
     app_cfg.mesh_node = Some(MeshNodeIdentity {
         account_tag: token.account_tag().to_string(),
         tunnel_id: token.tunnel_id().to_string(),
+        activation_probe_target: None,
         native_platform,
         registration_platform_claim: CONNECTOR_REGISTRATION_PLATFORM.to_string(),
     });
@@ -455,6 +458,7 @@ async fn run_tunnel(
         );
     }
 
+    let activation_probe = build_mesh_activation_probe(&cfg, requested_role)?;
     let endpoints = config::select_endpoints_from_config(&cfg, args.ipv6, args.connect_port)?;
     if args.insecure {
         config::warn_insecure();
@@ -567,6 +571,7 @@ async fn run_tunnel(
             on_disconnect: non_empty(args.on_disconnect),
             env: hook_env,
         },
+        activation_probe,
         device_state,
     };
 
@@ -623,6 +628,41 @@ fn build_app_config(
     })
 }
 
+fn build_mesh_activation_probe(cfg: &AppConfig, role: TunnelRole) -> Result<Option<Vec<u8>>> {
+    if role != TunnelRole::MeshNode {
+        return Ok(None);
+    }
+
+    let Some(target) = cfg
+        .mesh_node
+        .as_ref()
+        .and_then(|identity| identity.activation_probe_target)
+    else {
+        return Ok(None);
+    };
+    let source_config = if target.is_ipv4() {
+        &cfg.ipv4
+    } else {
+        &cfg.ipv6
+    };
+    let source_text = source_config.split('/').next().unwrap_or(source_config);
+    let source: IpAddr = source_text.parse().with_context(|| {
+        format!("invalid assigned Mesh source address '{source_text}' for activation probe")
+    })?;
+    let packet = icmp::compose_echo_request(source, target, 0).ok_or_else(|| {
+        anyhow!(
+            "Mesh activation probe target {target} does not match assigned source address {source}"
+        )
+    })?;
+
+    tracing::info!(
+        source = %source,
+        target = %target,
+        "Mesh activation probe enabled; one ICMP Echo Request will be sent after each successful CONNECT-IP session"
+    );
+    Ok(Some(packet))
+}
+
 fn maintain_edge_session(role: TunnelRole, always_reconnect: bool) -> bool {
     always_reconnect || role == TunnelRole::MeshNode
 }
@@ -675,5 +715,37 @@ mod tests {
     fn client_preserves_on_demand_reconnect_policy() {
         assert!(!maintain_edge_session(TunnelRole::Client, false));
         assert!(maintain_edge_session(TunnelRole::Client, true));
+    }
+
+    fn probe_config() -> crate::config::AppConfig {
+        crate::config::AppConfig {
+            role: TunnelRole::MeshNode,
+            mesh_node: Some(crate::config::MeshNodeIdentity {
+                account_tag: "a".repeat(32),
+                tunnel_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                activation_probe_target: Some("1.1.1.1".parse().unwrap()),
+                native_platform: "FreeBSD".to_string(),
+                registration_platform_claim: "linux".to_string(),
+            }),
+            ipv4: "100.96.0.1/32".to_string(),
+            ipv6: "2606:4700:cf1:1000::1/128".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn client_role_never_builds_a_mesh_activation_probe() {
+        let probe =
+            super::build_mesh_activation_probe(&probe_config(), TunnelRole::Client).unwrap();
+        assert!(probe.is_none());
+    }
+
+    #[test]
+    fn mesh_probe_uses_the_assigned_address_and_configured_target() {
+        let packet = super::build_mesh_activation_probe(&probe_config(), TunnelRole::MeshNode)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet[12..16], &[100, 96, 0, 1]);
+        assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
     }
 }

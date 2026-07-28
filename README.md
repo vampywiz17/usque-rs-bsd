@@ -46,7 +46,7 @@ bug fix that is not present upstream.
 | Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
-| Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow and automatic route-independent Edge-session maintenance; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
+| Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and an operator-selected one-packet activation probe; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
 | Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks |
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
@@ -158,6 +158,25 @@ when no route has produced an initial TUN packet. This is intentional connector
 lifecycle behavior and does not add or alter any route. `--always-reconnect`
 remains optional for client mode and is redundant in Mesh mode.
 
+Cloudflare does not expose an ingress connector in its connections API until
+the new CONNECT-IP session has carried an inner IP packet. A route-neutral
+connector cannot receive the first dashboard-routed packet while it is absent
+from that API. Mesh configs can therefore opt in to one minimal activation
+packet after each successful CONNECT-IP response by adding this field inside
+the existing `mesh_node` object:
+
+```json
+"activation_probe_target": "1.1.1.1"
+```
+
+The target is operator-selected and has no default. It must use the same address
+family as an assigned Mesh address. When enabled, the program sends one valid
+ICMP Echo Request (or ICMPv6 Echo Request) through the normal RFC 9484
+CONNECT-IP/HTTP/3 DATAGRAM path per new session. Failure is logged without
+tearing down an otherwise healthy tunnel. The option never runs in
+`nativetun` client mode and does not create routes, change firewall policy,
+send a status override, or call another Cloudflare API.
+
 The runtime MASQUE user agent remains truthful
 (`usque-nativetun/<version> (FreeBSD; MeshNode; MASQUE)`). The generated
 configuration records both `native_platform: "FreeBSD"` and
@@ -168,17 +187,20 @@ for observed lifecycle, host and quiche metrics. Mesh adds the Connector-only
 
 Mesh startup performs one authenticated account-scoped registration/config
 read. A rejected or expired registration stops startup instead of creating an
-untracked Edge session. No synthetic inner traffic is generated.
+untracked Edge session.
 
 > [!WARNING]
-> Current Mesh status: experimental and incomplete. Authorized tests confirm
-> successful Connector enrollment, a registered Device with the Cloudflare
-> Mesh Network Profile, assigned Mesh IPv4/IPv6 addresses, an established
-> MASQUE session, and accepted truthful device-state and `/h3-stats` reports.
-> However, the account-scoped WARP Connector connections API does not list the
-> session, so the Mesh dashboard remains `Down`. A prior `Online` observation
-> was not reproducible. This project does not claim that the current Mesh mode
-> is a supported or production-ready Cloudflare Mesh connector.
+> Current Mesh status remains experimental and unsupported by Cloudflare on
+> FreeBSD. Authorized A/B tests confirmed that registration, telemetry and an
+> idle MASQUE session alone leave the connections API empty and the dashboard
+> `Down`; the first real inner IP packet creates the connection and changes the
+> dashboard to `Up`. Once active, standard QUIC keepalive preserved the session,
+> reconnecting required a new inner packet, and bidirectional forwarding to a
+> dashboard-published route succeeded. The opt-in probe implements only that
+> minimal data-plane trigger; it is not represented as an official or supported
+> Cloudflare mechanism.
+> Release-build tests activated the API from zero connections with both IPv4
+> and IPv6 targets and without adding a route to either destination.
 
 ### Deployment roles
 

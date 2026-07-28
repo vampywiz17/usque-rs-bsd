@@ -36,6 +36,9 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   firewall policy.
 - Mesh mode proactively maintains its Edge session without waiting for routed
   TUN traffic; client mode retains its existing on-demand reconnect policy.
+- An optional, operator-selected activation target sends one valid ICMP or
+  ICMPv6 Echo Request over the established RFC 9484 data plane per Mesh session.
+  It has no default, performs no route changes and is never used by client mode.
 - Cloudflare rejects truthful FreeBSD Connector enrollment, so the experimental
   mode requires an explicit acknowledgement before sending the isolated
   `linux` enrollment platform claim. Runtime identity remains FreeBSD.
@@ -47,14 +50,15 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   its established H3 session.
 - Separate configs and interface names allow an egress client tunnel and an
   ingress Mesh tunnel to run simultaneously under administrator-owned routing.
-- Live validation completed for Connector registration, account-scoped config
-  retrieval, route-free eager MASQUE establishment, assigned IPv4/IPv6 Mesh
-  addresses, PMTUD, idle keepalive and bidirectional IP forwarding. An earlier
-  dashboard `Online` observation has not been reproducible: current sessions
-  are present as registered Mesh-profile Devices and report truthful device
-  state, but are absent from the WARP Connector connections API and therefore
-  remain `Down` in the Mesh dashboard. Mesh must be treated as experimental and
-  incomplete until that edge-association difference is identified.
+- Authorized A/B validation isolated the Mesh activation condition: enrollment,
+  device state, `/h3-stats` and an idle CONNECT-IP session leave the connections
+  API empty, while the first inner IP packet creates the connection and changes
+  the dashboard to `Up`. QUIC keepalive then preserves it; a new session needs
+  a new inner packet. The opt-in probe automates only this standard data-plane
+  trigger. Bidirectional forwarding to a dashboard-published route was also
+  verified. FreeBSD Mesh remains experimental and unsupported by Cloudflare.
+  Release-build live tests took the API from zero connections to `active` with
+  both IPv4 and IPv6 probe targets and no route to either target.
 
 ## Removed
 

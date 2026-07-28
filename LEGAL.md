@@ -130,6 +130,13 @@ established H3 session. The isolated Linux enrollment value described above is
 registration compatibility metadata, not telemetry, and is never reused as a
 runtime platform or official-client identity.
 
+The optional Mesh activation probe is network traffic, not telemetry: after a
+successful CONNECT-IP response it sends one real ICMP or ICMPv6 Echo Request to
+the IP address explicitly selected by the operator. It is disabled by default,
+never runs in client mode, and does not claim a fabricated response or state.
+Operators are responsible for choosing a destination they are permitted to
+contact.
+
 Operators are responsible for giving any required notice to affected users and
 for ensuring that collection and transmission of device data is permitted by
 their organization's policies and applicable data-protection law. Secrets and

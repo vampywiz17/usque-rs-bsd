@@ -30,6 +30,10 @@ impl std::fmt::Display for TunnelRole {
 pub struct MeshNodeIdentity {
     pub account_tag: String,
     pub tunnel_id: String,
+    /// Optional operator-selected IP destination for one standards-compliant
+    /// activation probe after each successful CONNECT-IP session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_probe_target: Option<IpAddr>,
     /// Actual operating system observed by this program.
     #[serde(default)]
     pub native_platform: String,
@@ -350,6 +354,7 @@ mod tests {
             mesh_node: Some(MeshNodeIdentity {
                 account_tag: "a".repeat(32),
                 tunnel_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                activation_probe_target: Some("192.0.2.1".parse().unwrap()),
                 native_platform: "FreeBSD".to_string(),
                 registration_platform_claim: "linux".to_string(),
             }),
@@ -361,6 +366,7 @@ mod tests {
         assert_eq!(decoded.mesh_node, cfg.mesh_node);
         assert!(!encoded.contains("tunnel_secret"));
         assert!(!encoded.contains("warp_connector_token"));
+        assert!(encoded.contains("\"activation_probe_target\":\"192.0.2.1\""));
         assert_eq!(
             decoded.mesh_node.unwrap().registration_platform_claim,
             "linux"

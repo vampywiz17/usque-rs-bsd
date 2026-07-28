@@ -1,3 +1,51 @@
+use std::net::IpAddr;
+
+const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
+const ICMPV6_TYPE_ECHO_REQUEST: u8 = 128;
+const ECHO_IDENTIFIER: u16 = 0x5551;
+
+/// Compose a minimal standards-compliant ICMP Echo Request as a complete IP
+/// packet. Source and destination must belong to the same address family.
+pub fn compose_echo_request(source: IpAddr, destination: IpAddr, sequence: u16) -> Option<Vec<u8>> {
+    match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            let total_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN;
+            let mut out = vec![0u8; total_len];
+            out[0] = 0x45;
+            out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+            out[8] = 64;
+            out[9] = 1;
+            out[12..16].copy_from_slice(&source.octets());
+            out[16..20].copy_from_slice(&destination.octets());
+            out[20] = ICMP_TYPE_ECHO_REQUEST;
+            out[24..26].copy_from_slice(&ECHO_IDENTIFIER.to_be_bytes());
+            out[26..28].copy_from_slice(&sequence.to_be_bytes());
+
+            let ip_checksum = checksum(&out[..IPV4_HEADER_LEN]);
+            out[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+            let icmp_checksum = checksum(&out[IPV4_HEADER_LEN..]);
+            out[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+            Some(out)
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            let mut out = vec![0u8; IPV6_HEADER_LEN + ICMP_HEADER_LEN];
+            out[0] = 0x60;
+            out[4..6].copy_from_slice(&(ICMP_HEADER_LEN as u16).to_be_bytes());
+            out[6] = 58;
+            out[7] = 64;
+            out[8..24].copy_from_slice(&source.octets());
+            out[24..40].copy_from_slice(&destination.octets());
+            out[40] = ICMPV6_TYPE_ECHO_REQUEST;
+            out[44..46].copy_from_slice(&ECHO_IDENTIFIER.to_be_bytes());
+            out[46..48].copy_from_slice(&sequence.to_be_bytes());
+
+            let icmp_checksum = icmpv6_checksum(&out[8..24], &out[24..40], &out[40..]);
+            out[42..44].copy_from_slice(&icmp_checksum.to_be_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
+}
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const ICMP_HEADER_LEN: usize = 8;
@@ -105,6 +153,52 @@ fn icmpv6_checksum(src: &[u8], dst: &[u8], icmp: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv4_echo_request_has_valid_headers_and_checksums() {
+        let source = "100.96.0.1".parse().unwrap();
+        let destination = "1.1.1.1".parse().unwrap();
+        let packet = compose_echo_request(source, destination, 7).unwrap();
+
+        assert_eq!(packet.len(), 28);
+        assert_eq!(packet[0], 0x45);
+        assert_eq!(packet[8], 64);
+        assert_eq!(packet[9], 1);
+        assert_eq!(&packet[12..16], &[100, 96, 0, 1]);
+        assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
+        assert_eq!(packet[20], ICMP_TYPE_ECHO_REQUEST);
+        assert_eq!(u16::from_be_bytes([packet[26], packet[27]]), 7);
+        assert_eq!(checksum(&packet[..IPV4_HEADER_LEN]), 0);
+        assert_eq!(checksum(&packet[IPV4_HEADER_LEN..]), 0);
+    }
+
+    #[test]
+    fn ipv6_echo_request_has_valid_pseudo_header_checksum() {
+        let source = "2606:4700:cf1:1000::1".parse().unwrap();
+        let destination = "2606:4700:4700::1111".parse().unwrap();
+        let packet = compose_echo_request(source, destination, 9).unwrap();
+
+        assert_eq!(packet.len(), 48);
+        assert_eq!(packet[0], 0x60);
+        assert_eq!(packet[6], 58);
+        assert_eq!(packet[7], 64);
+        assert_eq!(packet[40], ICMPV6_TYPE_ECHO_REQUEST);
+        assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), 9);
+        assert_eq!(
+            icmpv6_checksum(&packet[8..24], &packet[24..40], &packet[40..]),
+            0
+        );
+    }
+
+    #[test]
+    fn echo_request_rejects_mixed_address_families() {
+        assert!(compose_echo_request(
+            "100.96.0.1".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+            0,
+        )
+        .is_none());
+    }
 
     #[test]
     fn ipv4_frag_needed_quotes_packet_and_reports_mtu() {
