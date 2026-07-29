@@ -51,19 +51,11 @@ pub struct DeviceUpdate {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ApiError {
     #[serde(default)]
-    pub result: serde_json::Value,
-    #[serde(default)]
-    pub success: bool,
-    #[serde(default)]
     pub errors: Vec<ErrorInfo>,
-    #[serde(default)]
-    pub messages: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ErrorInfo {
-    #[serde(default)]
-    pub code: i64,
     #[serde(default)]
     pub message: String,
 }
@@ -86,46 +78,12 @@ impl ApiError {
 pub struct AccountData {
     #[serde(default)]
     pub id: String,
-    #[serde(default, rename = "type")]
-    pub account_data_type: String,
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub key: String,
-    #[serde(default)]
-    pub key_type: String,
-    #[serde(default, rename = "tunnel_type")]
-    pub tun_type: String,
     #[serde(default)]
     pub account: Account,
     #[serde(default)]
     pub config: AccountConfig,
     #[serde(default)]
-    pub warp_enabled: bool,
-    #[serde(default)]
-    pub waitlist_enabled: bool,
-    #[serde(default)]
-    pub created: String,
-    #[serde(default)]
-    pub updated: String,
-    #[serde(default)]
-    pub tos: String,
-    #[serde(default)]
-    pub place: i64,
-    #[serde(default)]
-    pub locale: String,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub install_id: String,
-    #[serde(default)]
     pub token: String,
-    #[serde(default)]
-    pub fcm_token: String,
-    #[serde(default)]
-    pub serial_number: String,
     #[serde(default)]
     pub policy: Policy,
 }
@@ -135,35 +93,11 @@ pub struct Account {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
-    pub account_type: String,
-    #[serde(default)]
-    pub created: String,
-    #[serde(default)]
-    pub updated: String,
-    #[serde(default)]
-    pub managed: String,
-    #[serde(default)]
-    pub organization: String,
-    #[serde(default)]
-    pub premium_data: i64,
-    #[serde(default)]
-    pub quota: i64,
-    #[serde(default)]
-    pub warp_plus: bool,
-    #[serde(default)]
-    pub referral_count: i64,
-    #[serde(default)]
-    pub referral_renewal_countdown: i64,
-    #[serde(default)]
-    pub role: String,
-    #[serde(default)]
     pub license: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AccountConfig {
-    #[serde(default)]
-    pub client_id: String,
     #[serde(default)]
     pub peers: Vec<Peer>,
     #[serde(default)]
@@ -209,9 +143,5 @@ pub struct Policy {
     #[serde(default)]
     pub policy_id: String,
     #[serde(default)]
-    pub organization: String,
-    #[serde(default)]
     pub switch_locked: bool,
-    #[serde(default)]
-    pub tunnel_protocol: String,
 }

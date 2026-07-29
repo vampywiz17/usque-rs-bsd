@@ -525,6 +525,9 @@ async fn run_tunnel_session(
     result
 }
 
+// This is the central protocol pump. Explicit arguments make mutable quiche,
+// H3, TUN and UDP state ownership auditable across every await point.
+#[allow(clippy::too_many_arguments)]
 async fn data_loop(
     socket: &tokio::net::UdpSocket,
     endpoint: SocketAddr,
@@ -607,7 +610,7 @@ async fn data_loop(
     });
 
     let result: Result<()> = async {
-        let mut tx_queue: VecDeque<TxDatagram> = VecDeque::with_capacity(tx_queue_len.min(65_536));
+        let mut tx_queue: VecDeque<TxDatagram> = VecDeque::with_capacity(queue_size);
         let mut tun_reader_closed = false;
         let mut last_telemetry_sample = Instant::now() - Duration::from_secs(1);
         // Publish the initial Mesh path state as soon as CONNECT succeeds.
@@ -705,7 +708,7 @@ async fn data_loop(
                 dev.current_mtu(),
             );
             for icmp_packet in &progress.icmp_packets {
-                if let Err(err) = dev.send_packet(&icmp_packet).await {
+                if let Err(err) = dev.send_packet(icmp_packet).await {
                     tracing::debug!("failed to return ICMP Packet Too Big to TUN: {err:#}");
                 }
             }
@@ -851,47 +854,6 @@ fn publish_tunnel_metrics(conn: &quiche::Connection, reporter: Option<&DeviceSta
         bytes_lost_upstream: path.lost_bytes,
         bytes_retransmitted_upstream: path.stream_retrans_bytes,
     });
-}
-
-async fn build_tx_datagram(
-    conn: &quiche::Connection,
-    flow_prefix: &[u8],
-    mut pkt: Vec<u8>,
-    stats: &Arc<Stats>,
-    dev: &Arc<TunRsDevice>,
-) -> Option<TxDatagram> {
-    if let Err(e) = packet::prepare_outgoing(&mut pkt) {
-        stats.dropped.fetch_add(1, Ordering::Relaxed);
-        tracing::trace!("dropping outgoing packet: {e}");
-        return None;
-    }
-
-    let ip_len = pkt.len();
-    let mut dgram = Vec::with_capacity(flow_prefix.len() + ip_len);
-    dgram.extend_from_slice(flow_prefix);
-    dgram.extend_from_slice(&pkt);
-
-    if let Some(max_len) = conn.dgram_max_writable_len() {
-        if dgram.len() > max_len {
-            stats.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                "datagram too large for peer/path: {} > {}; generating ICMP Packet Too Big if possible",
-                dgram.len(),
-                max_len
-            );
-            if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&pkt, dev.current_mtu()) {
-                let _ = dev.send_packet(&icmp_pkt).await;
-            }
-            return None;
-        }
-    }
-
-    let wire_len = dgram.len();
-    Some(TxDatagram {
-        bytes: dgram,
-        wire_len,
-        ip_len,
-    })
 }
 
 fn queue_tx_datagrams(
@@ -1053,6 +1015,9 @@ async fn drain_incoming_datagrams(
     }
 }
 
+// The one-packet/reconnect path deliberately shares the live protocol state
+// explicitly with the steady-state pump.
+#[allow(clippy::too_many_arguments)]
 async fn send_packet_datagram(
     socket: &tokio::net::UdpSocket,
     endpoint: SocketAddr,

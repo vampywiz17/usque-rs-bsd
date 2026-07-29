@@ -6,4 +6,3 @@ pub mod icmp;
 pub mod masque;
 pub mod mesh;
 pub mod packet;
-pub mod tunnel;

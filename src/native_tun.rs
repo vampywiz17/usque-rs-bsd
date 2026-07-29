@@ -1,7 +1,5 @@
-use crate::api::tunnel::TunnelDevice;
 use crate::config::AppConfig;
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
@@ -37,6 +35,10 @@ impl TunRsDevice {
     pub async fn send_packet(&self, packet: &[u8]) -> Result<()> {
         self.dev.send(packet).await.context("tun-rs send failed")?;
         Ok(())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn mtu(&self) -> Result<u16> {
@@ -171,20 +173,5 @@ mod tests {
         assert!(!ipv6_path_supported(1279));
         assert!(ipv6_path_supported(1280));
         assert!(ipv6_path_supported(1500));
-    }
-}
-
-#[async_trait]
-impl TunnelDevice for Arc<TunRsDevice> {
-    async fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
-        self.recv_packet(buf).await
-    }
-
-    async fn write_packet(&self, packet: &[u8]) -> Result<()> {
-        self.send_packet(packet).await
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }

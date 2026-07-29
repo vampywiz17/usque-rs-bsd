@@ -6,7 +6,6 @@ use crate::api::masque::{
     PathMtuConfig, QuicTransportConfig, ReconnectPolicy,
 };
 use crate::api::mesh::{self, MeshNodeToken, CONNECTOR_REGISTRATION_PLATFORM};
-use crate::api::tunnel::TunnelDevice;
 use crate::config::{self, AppConfig, MeshNodeIdentity, TunnelRole};
 use crate::internal;
 use crate::models::{AccountData, DeviceIdentity, INVALID_PUBLIC_KEY};

@@ -51,6 +51,7 @@ bug fix that is not present upstream.
 | Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks |
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
+| Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
 
 The project deliberately remains tunnel-only. It does not take ownership of
 routes, DNS, firewall policy, proxying or split-tunnel rules; those belong to
@@ -69,7 +70,8 @@ Install the required build tools:
 pkg install -y rust cmake ninja pkgconf git ca_root_nss
 ```
 
-Build the release binary:
+Build the deployment binary with maximum runtime optimization (fat LTO and one
+code-generation unit):
 
 ```sh
 sh ./scripts/build-freebsd.sh
@@ -82,6 +84,22 @@ cargo build --release
 ```
 
 The resulting binary is `target/release/usque-nativetun`.
+
+For faster edit/build/test cycles, use the separate optimized development
+profile:
+
+```sh
+USQUE_BUILD_PROFILE=fast-release sh ./scripts/build-freebsd.sh
+
+# Or directly:
+cargo build --profile fast-release
+```
+
+Its binary is `target/fast-release/usque-nativetun`. The fast profile omits
+LTO, uses moderate optimization, and enables parallel code generation to
+shorten linking. It is intended for functional testing. Use the default
+`release` profile for deployment and performance measurements; its
+runtime-oriented settings remain unchanged.
 
 ## Registration
 

@@ -134,7 +134,7 @@ impl UdpBatchIo {
                     Err(err) => return Err(err).context("FreeBSD sendmmsg failed"),
                 }
             }
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(target_os = "freebsd"))]
@@ -193,13 +193,13 @@ impl UdpBatchIo {
             // Tokio's readiness guard. EAGAIN must reach try_io() so Tokio can
             // clear a stale readable notification. Converting it to Ok(0)
             // earlier leaves the socket readable forever and causes a busy loop.
-            return match socket.try_io(tokio::io::Interest::READABLE, || {
+            match socket.try_io(tokio::io::Interest::READABLE, || {
                 recvmmsg_nonblocking(socket.as_raw_fd(), &mut self.rx_buffers, &mut self.tx_lens)
             }) {
                 Ok(count) => Ok(count),
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
                 Err(err) => Err(err),
-            };
+            }
         }
 
         #[cfg(not(target_os = "freebsd"))]

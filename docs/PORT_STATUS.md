@@ -60,6 +60,10 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   verified. FreeBSD Mesh remains experimental and unsupported by Cloudflare.
   Release-build live tests took the API from zero connections to `active` with
   both IPv4 and IPv6 probe targets and no route to either target.
+- Build profiles separate concerns: `release` retains fat LTO and one codegen
+  unit for maximum deployed runtime optimization, while `fast-release` omits
+  LTO and uses sixteen codegen units to shorten iterative FreeBSD builds without
+  silently weakening the deployment artifact.
 
 ## Removed
 

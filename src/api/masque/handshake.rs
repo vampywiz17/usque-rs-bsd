@@ -90,6 +90,9 @@ pub(super) async fn complete_quic_handshake(
     Ok(())
 }
 
+// Keep the QUIC/H3 state and I/O buffers explicit at this protocol boundary;
+// bundling mutable transport state would obscure ownership without reducing work.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn wait_connect_response(
     socket: &tokio::net::UdpSocket,
     endpoint: SocketAddr,

@@ -7,7 +7,6 @@ description = "Native-TUN-only Rust port of usque using tun-rs and quiche MASQUE
 
 [dependencies]
 anyhow = "1"
-async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -42,3 +41,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.fast-release]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
