@@ -16,7 +16,7 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use p256::pkcs8::EncodePublicKey;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -46,7 +46,7 @@ pub enum Commands {
     NativeTun(NativeTunArgs),
     /// Run a registered Mesh node without managing routes or firewall policy.
     #[command(name = "mesh-node")]
-    MeshNode(NativeTunArgs),
+    MeshNode(MeshNodeArgs),
     /// Print version information.
     Version,
 }
@@ -191,6 +191,16 @@ pub struct NativeTunArgs {
     pub on_connect: String,
     #[arg(long, default_value = "")]
     pub on_disconnect: String,
+}
+
+#[derive(Debug, Args)]
+pub struct MeshNodeArgs {
+    #[command(flatten)]
+    pub tunnel: NativeTunArgs,
+    /// Override the Mesh activation probe destination. Without this flag, the
+    /// persisted config value is used, then Cloudflare's 1.1.1.1 service.
+    #[arg(long)]
+    pub activation_probe_target: Option<IpAddr>,
 }
 
 pub async fn run() -> Result<()> {
@@ -393,17 +403,24 @@ async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
 }
 
 async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
-    run_tunnel(config_path, args, TunnelRole::Client).await
+    run_tunnel(config_path, args, TunnelRole::Client, None).await
 }
 
-async fn mesh_node(config_path: &str, args: NativeTunArgs) -> Result<()> {
-    run_tunnel(config_path, args, TunnelRole::MeshNode).await
+async fn mesh_node(config_path: &str, args: MeshNodeArgs) -> Result<()> {
+    run_tunnel(
+        config_path,
+        args.tunnel,
+        TunnelRole::MeshNode,
+        args.activation_probe_target,
+    )
+    .await
 }
 
 async fn run_tunnel(
     config_path: &str,
     args: NativeTunArgs,
     requested_role: TunnelRole,
+    activation_probe_override: Option<IpAddr>,
 ) -> Result<()> {
     let cfg = AppConfig::load(config_path)?;
     if cfg.role != requested_role {
@@ -458,7 +475,8 @@ async fn run_tunnel(
         );
     }
 
-    let activation_probe = build_mesh_activation_probe(&cfg, requested_role)?;
+    let activation_probe =
+        build_mesh_activation_probe(&cfg, requested_role, activation_probe_override)?;
     let endpoints = config::select_endpoints_from_config(&cfg, args.ipv6, args.connect_port)?;
     if args.insecure {
         config::warn_insecure();
@@ -628,18 +646,24 @@ fn build_app_config(
     })
 }
 
-fn build_mesh_activation_probe(cfg: &AppConfig, role: TunnelRole) -> Result<Option<Vec<u8>>> {
+const DEFAULT_MESH_ACTIVATION_PROBE_TARGET: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+fn build_mesh_activation_probe(
+    cfg: &AppConfig,
+    role: TunnelRole,
+    override_target: Option<IpAddr>,
+) -> Result<Option<Vec<u8>>> {
     if role != TunnelRole::MeshNode {
         return Ok(None);
     }
 
-    let Some(target) = cfg
-        .mesh_node
-        .as_ref()
-        .and_then(|identity| identity.activation_probe_target)
-    else {
-        return Ok(None);
-    };
+    let target = override_target
+        .or_else(|| {
+            cfg.mesh_node
+                .as_ref()
+                .and_then(|identity| identity.activation_probe_target)
+        })
+        .unwrap_or(DEFAULT_MESH_ACTIVATION_PROBE_TARGET);
     let source_config = if target.is_ipv4() {
         &cfg.ipv4
     } else {
@@ -658,7 +682,7 @@ fn build_mesh_activation_probe(cfg: &AppConfig, role: TunnelRole) -> Result<Opti
     tracing::info!(
         source = %source,
         target = %target,
-        "Mesh activation probe enabled; one ICMP Echo Request will be sent after each successful CONNECT-IP session"
+        "Mesh activation probe configured; one ICMP Echo Request will be sent after each successful CONNECT-IP session"
     );
     Ok(Some(packet))
 }
@@ -723,7 +747,7 @@ mod tests {
             mesh_node: Some(crate::config::MeshNodeIdentity {
                 account_tag: "a".repeat(32),
                 tunnel_id: "00000000-0000-0000-0000-000000000000".to_string(),
-                activation_probe_target: Some("1.1.1.1".parse().unwrap()),
+                activation_probe_target: Some("192.0.2.10".parse().unwrap()),
                 native_platform: "FreeBSD".to_string(),
                 registration_platform_claim: "linux".to_string(),
             }),
@@ -735,17 +759,77 @@ mod tests {
 
     #[test]
     fn client_role_never_builds_a_mesh_activation_probe() {
-        let probe =
-            super::build_mesh_activation_probe(&probe_config(), TunnelRole::Client).unwrap();
+        let probe = super::build_mesh_activation_probe(
+            &probe_config(),
+            TunnelRole::Client,
+            Some("1.1.1.1".parse().unwrap()),
+        )
+        .unwrap();
         assert!(probe.is_none());
     }
 
     #[test]
     fn mesh_probe_uses_the_assigned_address_and_configured_target() {
-        let packet = super::build_mesh_activation_probe(&probe_config(), TunnelRole::MeshNode)
+        let packet =
+            super::build_mesh_activation_probe(&probe_config(), TunnelRole::MeshNode, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(&packet[12..16], &[100, 96, 0, 1]);
+        assert_eq!(&packet[16..20], &[192, 0, 2, 10]);
+    }
+
+    #[test]
+    fn mesh_probe_defaults_to_cloudflare_dns() {
+        let mut cfg = probe_config();
+        cfg.mesh_node.as_mut().unwrap().activation_probe_target = None;
+        let packet = super::build_mesh_activation_probe(&cfg, TunnelRole::MeshNode, None)
             .unwrap()
             .unwrap();
-        assert_eq!(&packet[12..16], &[100, 96, 0, 1]);
         assert_eq!(&packet[16..20], &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn mesh_probe_cli_target_overrides_persisted_target() {
+        let packet = super::build_mesh_activation_probe(
+            &probe_config(),
+            TunnelRole::MeshNode,
+            Some("203.0.113.7".parse().unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&packet[16..20], &[203, 0, 113, 7]);
+    }
+
+    #[test]
+    fn mesh_cli_accepts_activation_probe_override() {
+        use clap::Parser as _;
+
+        let cli = super::Cli::try_parse_from([
+            "usque-nativetun",
+            "mesh-node",
+            "--activation-probe-target",
+            "2606:4700:4700::1111",
+        ])
+        .unwrap();
+        let super::Commands::MeshNode(args) = cli.command else {
+            panic!("expected Mesh node command");
+        };
+        assert_eq!(
+            args.activation_probe_target,
+            Some("2606:4700:4700::1111".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn client_cli_rejects_mesh_activation_probe_override() {
+        use clap::Parser as _;
+
+        assert!(super::Cli::try_parse_from([
+            "usque-nativetun",
+            "nativetun",
+            "--activation-probe-target",
+            "1.1.1.1",
+        ])
+        .is_err());
     }
 }

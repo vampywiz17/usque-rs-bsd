@@ -36,9 +36,10 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   firewall policy.
 - Mesh mode proactively maintains its Edge session without waiting for routed
   TUN traffic; client mode retains its existing on-demand reconnect policy.
-- An optional, operator-selected activation target sends one valid ICMP or
-  ICMPv6 Echo Request over the established RFC 9484 data plane per Mesh session.
-  It has no default, performs no route changes and is never used by client mode.
+- Every Mesh session sends one valid ICMP or ICMPv6 Echo Request over the
+  established RFC 9484 data plane. The target defaults to Cloudflare's 1.1.1.1
+  service and supports Mesh-only CLI and persistent config overrides. It
+  performs no route changes and is never used by client mode.
 - Cloudflare rejects truthful FreeBSD Connector enrollment, so the experimental
   mode requires an explicit acknowledgement before sending the isolated
   `linux` enrollment platform claim. Runtime identity remains FreeBSD.
@@ -54,7 +55,7 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   device state, `/h3-stats` and an idle CONNECT-IP session leave the connections
   API empty, while the first inner IP packet creates the connection and changes
   the dashboard to `Up`. QUIC keepalive then preserves it; a new session needs
-  a new inner packet. The opt-in probe automates only this standard data-plane
+  a new inner packet. The automatic Mesh-only probe automates only this standard data-plane
   trigger. Bidirectional forwarding to a dashboard-published route was also
   verified. FreeBSD Mesh remains experimental and unsupported by Cloudflare.
   Release-build live tests took the API from zero connections to `active` with

@@ -30,8 +30,9 @@ impl std::fmt::Display for TunnelRole {
 pub struct MeshNodeIdentity {
     pub account_tag: String,
     pub tunnel_id: String,
-    /// Optional operator-selected IP destination for one standards-compliant
-    /// activation probe after each successful CONNECT-IP session.
+    /// Optional persistent override for the standards-compliant activation
+    /// probe after each successful CONNECT-IP session. Mesh runtime falls back
+    /// to Cloudflare's 1.1.1.1 service when this value and the CLI override are absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_probe_target: Option<IpAddr>,
     /// Actual operating system observed by this program.
