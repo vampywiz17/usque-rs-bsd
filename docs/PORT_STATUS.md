@@ -64,6 +64,10 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   unit for maximum deployed runtime optimization, while `fast-release` omits
   LTO and uses sixteen codegen units to shorten iterative FreeBSD builds without
   silently weakening the deployment artifact.
+- GitHub Actions enforces rustfmt, warnings-as-errors Clippy, a debug build and
+  all tests on every main-branch push and pull request.
+- The operator-run FreeBSD connection stress harness repeatedly validates real
+  QUIC/HTTP/3 CONNECT-IP setup and teardown in both client and Mesh roles.
 
 ## Removed
 
@@ -80,7 +84,10 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 Run this on a Rust host:
 
 ```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo check
+cargo test
 cargo build --release
 ```
 

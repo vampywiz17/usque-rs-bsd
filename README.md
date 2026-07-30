@@ -52,6 +52,7 @@ bug fix that is not present upstream.
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 | Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
+| Verification | Build and unit tests | CI formatting and warnings-as-errors Clippy gates plus an operator-run FreeBSD QUIC/CONNECT-IP connection stress harness for client and Mesh roles |
 
 The project deliberately remains tunnel-only. It does not take ownership of
 routes, DNS, firewall policy, proxying or split-tunnel rules; those belong to
@@ -407,9 +408,26 @@ The immediate goal is to establish a reliable FreeBSD baseline:
 Useful checks:
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo check
+cargo test
 cargo build --release
 ```
+
+GitHub Actions runs formatting, Clippy with warnings denied, a debug build and
+the complete test suite for every push and pull request targeting `main`.
+
+Repeated live QUIC/HTTP/3 CONNECT-IP establishment can be verified on FreeBSD
+without changing routes or firewall policy:
+
+```sh
+sudo ./scripts/stress-connect.sh --mode client --config ./config.json
+sudo ./scripts/stress-connect.sh --mode mesh --config ./mesh.json
+```
+
+See [Connection stress test](docs/CONNECTION_STRESS_TEST.md) for safety
+properties, options and result interpretation.
 
 ## Disclaimer
 
