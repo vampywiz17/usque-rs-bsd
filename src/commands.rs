@@ -15,6 +15,8 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use p256::pkcs8::EncodePublicKey;
 use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -58,8 +60,12 @@ pub struct RegisterArgs {
     pub model: String,
     #[arg(short, long, default_value = "")]
     pub name: String,
-    #[arg(long, default_value = "")]
+    /// Cloudflare Access enrollment JWT. Prefer --jwt-file for automation.
+    #[arg(long, default_value = "", conflicts_with = "jwt_file")]
     pub jwt: String,
+    /// Private enrollment JWT file. Unix permissions are validated before use.
+    #[arg(long, value_name = "PATH", conflicts_with = "jwt")]
+    pub jwt_file: Option<PathBuf>,
     #[arg(short = 'a', long)]
     pub accept_tos: bool,
 }
@@ -220,6 +226,7 @@ pub async fn run() -> Result<()> {
 }
 
 async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
+    let jwt = load_registration_jwt(&args)?;
     if Path::new(config_path).exists() {
         println!("You already have a config. Do you want to overwrite it? (y/n) ");
         let mut response = String::new();
@@ -232,7 +239,7 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
     }
 
     let identity = internal::detect_device_identity(&args.name, &args.model, &args.locale);
-    if args.jwt.is_empty() {
+    if jwt.is_none() {
         tracing::info!(
             "Registering MASQUE device '{}' ({} {}, client {})",
             identity.name,
@@ -248,25 +255,96 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
     }
 
     let (private_key_der, public_key_der) = internal::generate_ec_key_pair()?;
-    let account = cloudflare::register(
-        &identity,
-        &public_key_der,
-        if args.jwt.is_empty() {
-            None
-        } else {
-            Some(args.jwt.as_str())
-        },
-        args.accept_tos,
-    )
-    .await?;
+    let account =
+        cloudflare::register(&identity, &public_key_der, jwt.as_deref(), args.accept_tos).await?;
 
     tracing::info!("Enrolling device key...");
     let updated = enroll_or_fail(&account, &public_key_der, &identity).await?;
 
     let app_cfg = build_app_config(&updated, &private_key_der, &account.token, identity)?;
-    app_cfg.save(config_path)?;
+    app_cfg.save_sensitive(config_path)?;
     tracing::info!("Config saved to {config_path}");
     Ok(())
+}
+
+fn load_registration_jwt(args: &RegisterArgs) -> Result<Option<String>> {
+    if let Some(path) = &args.jwt_file {
+        return read_private_registration_token(path).map(Some);
+    }
+    let jwt = args.jwt.trim();
+    Ok((!jwt.is_empty()).then(|| jwt.to_string()))
+}
+
+fn read_private_registration_token(path: &Path) -> Result<String> {
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "registration JWT file path must be absolute: {}",
+            path.display()
+        ));
+    }
+
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect registration JWT file {}", path.display()))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(anyhow!(
+            "registration JWT path is not a non-symlink regular file: {}",
+            path.display()
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open registration JWT file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect open JWT file {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("registration JWT path is not a regular file"));
+    }
+    if metadata.len() > 64 * 1024 {
+        return Err(anyhow!("registration JWT file exceeds 64 KiB"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(anyhow!(
+                "registration JWT file must be owned by the current effective user"
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(anyhow!(
+                "registration JWT file must not be accessible by group or others (use chmod 600 {})",
+                path.display()
+            ));
+        }
+    }
+
+    let mut jwt = String::new();
+    file.take(64 * 1024 + 1)
+        .read_to_string(&mut jwt)
+        .with_context(|| format!("failed to read registration JWT file {}", path.display()))?;
+    if jwt.len() > 64 * 1024 {
+        return Err(anyhow!("registration JWT file exceeds 64 KiB"));
+    }
+    let jwt = jwt.trim();
+    if jwt.is_empty() {
+        return Err(anyhow!("registration JWT file is empty"));
+    }
+    if jwt.contains(['\r', '\n']) {
+        return Err(anyhow!("registration JWT must contain exactly one line"));
+    }
+    Ok(jwt.to_string())
 }
 
 async fn mesh_register(config_path: &str, args: MeshRegisterArgs) -> Result<()> {
@@ -830,5 +908,71 @@ mod tests {
             "1.1.1.1",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn client_registration_rejects_both_jwt_inputs() {
+        use clap::Parser as _;
+
+        assert!(super::Cli::try_parse_from([
+            "usque-nativetun",
+            "register",
+            "--jwt",
+            "header.payload.signature",
+            "--jwt-file",
+            "/tmp/enrollment.jwt",
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_jwt_file_requires_owner_only_permissions() {
+        use clap::Parser as _;
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "header.payload.signature").unwrap();
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cli = super::Cli::try_parse_from([
+            "usque-nativetun",
+            "register",
+            "--jwt-file",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let super::Commands::Register(args) = cli.command else {
+            panic!("expected register command");
+        };
+        assert_eq!(
+            super::load_registration_jwt(&args).unwrap().as_deref(),
+            Some("header.payload.signature")
+        );
+
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o640)).unwrap();
+        let error = super::load_registration_jwt(&args).unwrap_err().to_string();
+        assert!(error.contains("chmod 600"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_jwt_file_rejects_symlinks() {
+        use std::fs;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.jwt");
+        fs::write(&target, "header.payload.signature").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.path().join("link.jwt");
+        symlink(&target, &link).unwrap();
+
+        let error = super::read_private_registration_token(&link)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-symlink"));
     }
 }

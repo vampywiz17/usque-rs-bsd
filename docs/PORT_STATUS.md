@@ -7,6 +7,9 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 ## Kept
 
 - Cloudflare registration API ported to Rust.
+- Client registration accepts an owner-only, non-symlink JWT file through
+  `--jwt-file`, allowing a privilege-separated OPNsense frontend to avoid
+  exposing enrollment credentials in process arguments.
 - MASQUE key enrollment API ported to Rust.
 - `config.json` fields needed by native TUN preserved.
 - Native TUN mode implemented with `tun-rs`.

@@ -110,6 +110,22 @@ Create the `config.json` file required by native TUN mode:
 ./target/release/usque-nativetun register --accept-tos
 ```
 
+For browser-assisted or other automated Cloudflare Access enrollment, keep the
+short-lived JWT out of the process argument list:
+
+```sh
+chmod 600 /absolute/path/enrollment.jwt
+./target/release/usque-nativetun \
+  --config /absolute/path/client.json register \
+  --jwt-file /absolute/path/enrollment.jwt --accept-tos
+```
+
+On Unix the JWT path must be absolute, owned by the effective user, refer directly
+to a regular file, and deny all group/other access. The resulting
+credential-bearing configuration is also restricted to mode `0600`. The legacy
+`--jwt` option remains available for interactive compatibility, but automation
+should use `--jwt-file`.
+
 The generated configuration contains credentials. Do not publish or commit it.
 
 ## Run
