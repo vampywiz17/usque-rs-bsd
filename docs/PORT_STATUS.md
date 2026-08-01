@@ -39,6 +39,11 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   firewall policy.
 - Mesh mode proactively maintains its Edge session without waiting for routed
   TUN traffic; client mode retains its existing on-demand reconnect policy.
+- Mesh mode advertises a finite 90-second QUIC `max_idle_timeout` by default.
+  Missing peer activity therefore reaches quiche's normal RFC 9000 timeout
+  path, after which the existing supervisor reconnects and sends the one-time
+  activation packet. Client mode retains its previous unlimited idle timeout.
+  The Mesh timeout is configurable with `--max-idle-timeout`.
 - Every Mesh session sends one valid ICMP or ICMPv6 Echo Request over the
   established RFC 9484 data plane. The target defaults to Cloudflare's 1.1.1.1
   service and supports Mesh-only CLI and persistent config overrides. It
@@ -57,11 +62,16 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 - Authorized A/B validation isolated the Mesh activation condition: enrollment,
   device state, `/h3-stats` and an idle CONNECT-IP session leave the connections
   API empty, while the first inner IP packet creates the connection and changes
-  the dashboard to `Up`. QUIC keepalive then preserves it; a new session needs
-  a new inner packet. The automatic Mesh-only probe automates only this standard data-plane
-  trigger. Bidirectional forwarding to a dashboard-published route was also
-  verified. FreeBSD Mesh remains experimental and unsupported by Cloudflare.
-  Release-build live tests took the API from zero connections to `active` with
+  the dashboard to `Up`; a new session needs a new inner packet. The automatic
+  Mesh-only probe automates only this standard data-plane trigger. Bidirectional
+  forwarding to a dashboard-published route was also verified. A subsequent
+  8-9 hour idle run showed that an Edge session can disappear while local device
+  telemetry remains connected. A correctly sourced inner packet did not revive
+  that session, whereas a reconnect immediately returned Mesh to `Up`. The
+  finite Mesh-only QUIC idle timeout addresses this failure without periodic
+  synthetic tunnel traffic or another API heartbeat. FreeBSD Mesh remains
+  experimental and unsupported by Cloudflare. Release-build live tests took the
+  API from zero connections to `active` with
   both IPv4 and IPv6 probe targets and no route to either target.
 - Build profiles separate concerns: `release` retains fat LTO and one codegen
   unit for maximum deployed runtime optimization, while `fast-release` omits

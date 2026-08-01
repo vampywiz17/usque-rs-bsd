@@ -35,6 +35,7 @@ const MESH_H3_STATS_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct QuicTransportConfig {
     pub keepalive_period: Duration,
+    pub max_idle_timeout: Duration,
     pub initial_packet_size: u16,
     pub cc_algorithm: String,
     pub initial_cwnd_packets: usize,
@@ -267,7 +268,8 @@ async fn run_tunnel_session(
         .load_priv_key_from_pem_file(tls_material.key_pem_file.path().to_str().unwrap())
         .map_err(|e| anyhow!("load client private key: {e}"))?;
 
-    quic_config.set_max_idle_timeout(0);
+    let max_idle_timeout_ms = duration_millis(cfg.quic.max_idle_timeout);
+    quic_config.set_max_idle_timeout(max_idle_timeout_ms);
     let udp_payload = if cfg.quic.initial_packet_size > 0 {
         usize::from(cfg.quic.initial_packet_size)
     } else {
@@ -321,10 +323,11 @@ async fn run_tunnel_session(
         .clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
     let tx_queue_len = cfg.io.tx_queue_len.max(1).min(packet_buffer_pool_size);
     tracing::info!(
-        "QUIC tuning: quiche=0.29.3 cc={} initial_cwnd_packets={} max_udp_payload={} pmtud={} pmtud_max_probes={} initial_tun_mtu={} max_tun_mtu={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
+        "QUIC tuning: quiche=0.29.3 cc={} initial_cwnd_packets={} max_udp_payload={} max_idle_timeout_ms={} pmtud={} pmtud_max_probes={} initial_tun_mtu={} max_tun_mtu={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
         cfg.quic.cc_algorithm.trim(),
         cfg.quic.initial_cwnd_packets,
         udp_payload,
+        max_idle_timeout_ms,
         cfg.path_mtu.enabled,
         cfg.path_mtu.max_probes,
         cfg.path_mtu.initial_tun_mtu,
@@ -523,6 +526,13 @@ async fn run_tunnel_session(
     }
 
     result
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    if duration.is_zero() {
+        return 0;
+    }
+    duration.as_millis().clamp(1, u128::from(u64::MAX)) as u64
 }
 
 // This is the central protocol pump. Explicit arguments make mutable quiche,
@@ -1129,6 +1139,13 @@ mod tests {
             .iter()
             .find(|header| header.name() == name)
             .map(|header| header.value())
+    }
+
+    #[test]
+    fn idle_timeout_uses_quiche_milliseconds() {
+        assert_eq!(duration_millis(Duration::ZERO), 0);
+        assert_eq!(duration_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_millis(Duration::from_secs(90)), 90_000);
     }
 
     #[test]

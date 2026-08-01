@@ -206,6 +206,10 @@ pub struct MeshNodeArgs {
     /// persisted config value is used, then Cloudflare's 1.1.1.1 service.
     #[arg(long)]
     pub activation_probe_target: Option<IpAddr>,
+    /// Maximum time without peer activity before quiche declares the Mesh
+    /// session dead and the supervisor reconnects. Use 0s to disable.
+    #[arg(long, default_value = "90s", value_parser = parse_duration)]
+    pub max_idle_timeout: Duration,
 }
 
 pub async fn run() -> Result<()> {
@@ -480,7 +484,7 @@ async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
 }
 
 async fn native_tun(config_path: &str, args: NativeTunArgs) -> Result<()> {
-    run_tunnel(config_path, args, TunnelRole::Client, None).await
+    run_tunnel(config_path, args, TunnelRole::Client, None, None).await
 }
 
 async fn mesh_node(config_path: &str, args: MeshNodeArgs) -> Result<()> {
@@ -489,6 +493,7 @@ async fn mesh_node(config_path: &str, args: MeshNodeArgs) -> Result<()> {
         args.tunnel,
         TunnelRole::MeshNode,
         args.activation_probe_target,
+        Some(args.max_idle_timeout),
     )
     .await
 }
@@ -498,6 +503,7 @@ async fn run_tunnel(
     args: NativeTunArgs,
     requested_role: TunnelRole,
     activation_probe_override: Option<IpAddr>,
+    mesh_max_idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let cfg = AppConfig::load(config_path)?;
     if cfg.role != requested_role {
@@ -550,6 +556,24 @@ async fn run_tunnel(
             "QUIC keepalive will send an RFC 9000 PING after {:?} of network inactivity",
             args.keepalive_period
         );
+    }
+    let max_idle_timeout = role_max_idle_timeout(requested_role, mesh_max_idle_timeout);
+    if requested_role == TunnelRole::MeshNode {
+        if max_idle_timeout.is_zero() {
+            tracing::warn!(
+                "Mesh QUIC idle timeout is disabled; silent Edge-session loss cannot trigger reconnect"
+            );
+        } else {
+            if !args.keepalive_period.is_zero() && max_idle_timeout <= args.keepalive_period {
+                return Err(anyhow!(
+                    "--max-idle-timeout ({max_idle_timeout:?}) must be greater than --keepalive-period ({:?})",
+                    args.keepalive_period
+                ));
+            }
+            tracing::info!(
+                "Mesh dead-peer detection will reconnect after {max_idle_timeout:?} without peer activity"
+            );
+        }
     }
 
     let activation_probe =
@@ -634,6 +658,7 @@ async fn run_tunnel(
         connect_profile,
         quic: QuicTransportConfig {
             keepalive_period: args.keepalive_period,
+            max_idle_timeout,
             initial_packet_size: args.initial_packet_size,
             cc_algorithm: args.cc,
             initial_cwnd_packets: args.initial_cwnd_packets,
@@ -764,6 +789,13 @@ fn build_mesh_activation_probe(
     Ok(Some(packet))
 }
 
+fn role_max_idle_timeout(role: TunnelRole, mesh_timeout: Option<Duration>) -> Duration {
+    match role {
+        TunnelRole::Client => Duration::ZERO,
+        TunnelRole::MeshNode => mesh_timeout.unwrap_or(Duration::from_secs(90)),
+    }
+}
+
 fn maintain_edge_session(role: TunnelRole, always_reconnect: bool) -> bool {
     always_reconnect || role == TunnelRole::MeshNode
 }
@@ -803,8 +835,9 @@ fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::maintain_edge_session;
+    use super::{maintain_edge_session, role_max_idle_timeout};
     use crate::config::TunnelRole;
+    use std::time::Duration;
 
     #[test]
     fn mesh_node_always_maintains_an_edge_session() {
@@ -816,6 +849,26 @@ mod tests {
     fn client_preserves_on_demand_reconnect_policy() {
         assert!(!maintain_edge_session(TunnelRole::Client, false));
         assert!(maintain_edge_session(TunnelRole::Client, true));
+    }
+
+    #[test]
+    fn mesh_role_uses_finite_dead_peer_timeout() {
+        assert_eq!(
+            role_max_idle_timeout(TunnelRole::MeshNode, Some(Duration::from_secs(75))),
+            Duration::from_secs(75)
+        );
+        assert_eq!(
+            role_max_idle_timeout(TunnelRole::MeshNode, None),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn client_role_preserves_infinite_idle_timeout() {
+        assert_eq!(
+            role_max_idle_timeout(TunnelRole::Client, Some(Duration::from_secs(90))),
+            Duration::ZERO
+        );
     }
 
     fn probe_config() -> crate::config::AppConfig {
@@ -895,6 +948,7 @@ mod tests {
             args.activation_probe_target,
             Some("2606:4700:4700::1111".parse().unwrap())
         );
+        assert_eq!(args.max_idle_timeout, Duration::from_secs(90));
     }
 
     #[test]
@@ -906,6 +960,19 @@ mod tests {
             "nativetun",
             "--activation-probe-target",
             "1.1.1.1",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn client_cli_rejects_mesh_idle_timeout() {
+        use clap::Parser as _;
+
+        assert!(super::Cli::try_parse_from([
+            "usque-nativetun",
+            "nativetun",
+            "--max-idle-timeout",
+            "90s",
         ])
         .is_err());
     }

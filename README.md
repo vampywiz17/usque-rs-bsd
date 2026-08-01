@@ -47,8 +47,8 @@ bug fix that is not present upstream.
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and one standards-compliant activation packet using Cloudflare's 1.1.1.1 service by default with Mesh-only overrides; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
-| Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic |
-| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks |
+| Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic, plus a finite Mesh-only QUIC idle timeout for dead-peer detection |
+| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; Mesh reconnects automatically after silent Edge-session loss |
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 | Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
@@ -238,11 +238,14 @@ untracked Edge session.
 > FreeBSD. Authorized A/B tests confirmed that registration, telemetry and an
 > idle MASQUE session alone leave the connections API empty and the dashboard
 > `Down`; the first real inner IP packet creates the connection and changes the
-> dashboard to `Up`. Once active, standard QUIC keepalive preserved the session,
-> reconnecting required a new inner packet, and bidirectional forwarding to a
-> dashboard-published route succeeded. The automatic Mesh-only probe implements only that
-> minimal data-plane trigger; it is not represented as an official or supported
-> Cloudflare mechanism.
+> dashboard to `Up`. Bidirectional forwarding to a dashboard-published route
+> also succeeded. A later 8-9 hour idle test exposed silent Edge-session loss:
+> device telemetry still appeared connected, but the Mesh connection and its
+> routed data plane were down. Sending a correctly sourced inner packet did not
+> restore the connection, while reconnecting did. Mesh mode therefore uses a
+> finite QUIC `max_idle_timeout`; quiche closes an unresponsive session and the
+> existing supervisor reconnects and sends the one-time activation packet.
+> This adds neither a periodic inner-tunnel heartbeat nor another API call.
 > Release-build tests activated the API from zero connections with both IPv4
 > and IPv6 targets and without adding a route to either destination.
 
@@ -311,6 +314,7 @@ other operating systems retain the wire contract but return an empty snapshot.
 | `--udp-batch-size` | `32` | FreeBSD `sendmmsg`/`recvmmsg` batch size; clamped to `1..64` |
 | `--udp-socket-buffer` | `8388608` | Desired per-direction growth target. Each new socket starts from the OS default, grows adaptively, verifies the effective `SO_RCVBUF`/`SO_SNDBUF` value and retains the largest accepted size |
 | `--keepalive-period` | `25s` | Periodically schedules an RFC 9000 QUIC PING to preserve QUIC and outbound UDP/NAT state; use `0s` to disable |
+| `--max-idle-timeout` | `90s` | Mesh-only QUIC dead-peer timeout. Missing peer activity closes the stale session so the supervisor can reconnect; `0s` disables detection |
 
 Socket-buffer negotiation is local and per socket: it never changes
 `kern.ipc.maxsockbuf` or any other system-wide setting. If the kernel rejects
@@ -384,6 +388,11 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.
+- Mesh sessions use a finite, configurable quiche `max_idle_timeout` (90
+  seconds by default). If peer activity ceases, the standard QUIC timeout path
+  closes the stale session and the Mesh supervisor reconnects. Client mode
+  retains its previous unlimited idle timeout and does not accept the Mesh-only
+  option.
 - The FreeBSD hot path batches already-produced QUIC UDP datagrams with
   `sendmmsg` and drains them with `recvmmsg`, reducing kernel/userspace
   transitions without changing MASQUE framing. A packet is batched only after
@@ -420,6 +429,19 @@ The immediate goal is to establish a reliable FreeBSD baseline:
 3. Validate IPv4/IPv6 routing and MTU handling.
 4. Benchmark upload and download throughput.
 5. Evaluate support for additional BSD systems.
+
+## Versioning
+
+Formal release tracking starts with version `0.8.0`. This project follows
+[Semantic Versioning](https://semver.org/): feature releases increment the
+minor version, compatible fixes increment the patch version, and breaking
+changes increment the major version after `1.0.0`. Before `1.0.0`, a minor
+release may contain a documented breaking change while the interfaces are
+still experimental.
+
+Release notes are maintained in [CHANGELOG.md](CHANGELOG.md). A version is not
+considered released merely because `Cargo.toml` changed; releases are identified
+by an annotated Git tag matching the package version, for example `v0.8.0`.
 
 Useful checks:
 
