@@ -1,6 +1,6 @@
 [package]
 name = "usque-nativetun"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "MIT"
 description = "Native-TUN-only Rust port of usque using tun-rs and quiche MASQUE/CONNECT-IP support; FreeBSD tuned release"

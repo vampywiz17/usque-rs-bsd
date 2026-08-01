@@ -48,7 +48,7 @@ bug fix that is not present upstream.
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and one standards-compliant activation packet using Cloudflare's 1.1.1.1 service by default with Mesh-only overrides; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic, plus a finite Mesh-only QUIC idle timeout for dead-peer detection |
-| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; Mesh reconnects automatically after silent Edge-session loss |
+| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; quiche `Finished`/`Reset` events on the RFC 9484 CONNECT-IP request stream terminate the session and invoke automatic endpoint rotation/reconnect |
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 | Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
@@ -239,13 +239,19 @@ untracked Edge session.
 > idle MASQUE session alone leave the connections API empty and the dashboard
 > `Down`; the first real inner IP packet creates the connection and changes the
 > dashboard to `Up`. Bidirectional forwarding to a dashboard-published route
-> also succeeded. A later 8-9 hour idle test exposed silent Edge-session loss:
-> device telemetry still appeared connected, but the Mesh connection and its
-> routed data plane were down. Sending a correctly sourced inner packet did not
-> restore the connection, while reconnecting did. Mesh mode therefore uses a
-> finite QUIC `max_idle_timeout`; quiche closes an unresponsive session and the
-> existing supervisor reconnects and sends the one-time activation packet.
-> This adds neither a periodic inner-tunnel heartbeat nor another API call.
+> also succeeded. Long-run testing then captured the exact failure: after 4
+> hours 35 minutes Cloudflare reset the original CONNECT-IP request stream with
+> HTTP/3 `H3_NO_ERROR` (`0x100`) while the underlying QUIC connection remained
+> open. RFC 9484 ties tunnel lifetime to that request stream, so the data plane
+> was already closed even though the old implementation continued reporting a
+> locally connected transport. The protocol pump now treats quiche
+> `Event::Finished` and `Event::Reset` on that specific stream as session
+> termination; the existing supervisor reconnects and the new session sends
+> its one-time activation packet. Auxiliary H3 requests such as `/h3-stats`
+> remain isolated and cannot trigger a false tunnel reconnect. The finite QUIC
+> idle timeout remains useful for an actually unresponsive peer, but was not
+> sufficient for this clean application-stream closure. This recovery adds
+> neither a periodic inner-tunnel heartbeat nor another API call.
 > Release-build tests activated the API from zero connections with both IPv4
 > and IPv6 targets and without adding a route to either destination.
 
@@ -393,6 +399,13 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   closes the stale session and the Mesh supervisor reconnects. Client mode
   retains its previous unlimited idle timeout and does not accept the Mesh-only
   option.
+- RFC 9484 ties an IP tunnel to its CONNECT-IP request stream. The runtime
+  retains that stream ID and treats quiche HTTP/3 `Finished` or `Reset`
+  events on it as authoritative tunnel closure, even if the underlying QUIC
+  connection remains open. The reconnect supervisor then establishes a new
+  QUIC/H3/CONNECT-IP session. Completion of unrelated request streams is
+  ignored for tunnel lifetime, and non-`Done` H3 polling errors also fail the
+  session closed instead of continuing with invalid HTTP/3 state.
 - The FreeBSD hot path batches already-produced QUIC UDP datagrams with
   `sendmmsg` and drains them with `recvmmsg`, reducing kernel/userspace
   transitions without changing MASQUE framing. A packet is batched only after

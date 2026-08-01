@@ -500,6 +500,7 @@ async fn run_tunnel_session(
         mtu,
         &flow_prefix,
         flow_id,
+        stream_id,
         &stats,
         cfg.device_state.as_ref(),
         cfg.connect_profile.reports_h3_stats(),
@@ -548,6 +549,7 @@ async fn data_loop(
     mtu: usize,
     flow_prefix: &[u8],
     flow_id: u64,
+    connect_stream_id: u64,
     stats: &Arc<Stats>,
     device_state: Option<&DeviceStateReporter>,
     report_h3_stats: bool,
@@ -639,7 +641,7 @@ async fn data_loop(
             // Receiving an ACK can schedule the next RFC 8899 probe. Drain
             // quiche immediately so discovery progresses even on an idle TUN.
             udp_batch.flush_quic(socket, conn).await?;
-            poll_h3(conn, h3_conn);
+            poll_h3(conn, h3_conn, connect_stream_id)?;
             drain_incoming_datagrams(conn, flow_id, stats, dev).await;
 
             let mut h3_output_queued = false;
@@ -940,7 +942,39 @@ fn queue_tx_datagrams(
     progress
 }
 
-fn poll_h3(conn: &mut quiche::Connection, h3_conn: &mut quiche::h3::Connection) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H3StreamTermination {
+    Finished,
+    Reset(u64),
+}
+
+// RFC 9484 section 4.1 ties the IP forwarding tunnel to the CONNECT-IP
+// request stream, not to the lifetime of the underlying QUIC connection.
+// Auxiliary request streams (for example Mesh /h3-stats) are independent.
+fn connect_ip_termination_reason(
+    connect_stream_id: u64,
+    stream_id: u64,
+    termination: H3StreamTermination,
+) -> Option<String> {
+    if stream_id != connect_stream_id {
+        return None;
+    }
+
+    Some(match termination {
+        H3StreamTermination::Finished => format!(
+            "CONNECT-IP request stream {stream_id} finished; the associated RFC 9484 tunnel is closed"
+        ),
+        H3StreamTermination::Reset(code) => format!(
+            "CONNECT-IP request stream {stream_id} was reset by the peer with HTTP/3 error code {code} (0x{code:x}); the associated RFC 9484 tunnel is closed"
+        ),
+    })
+}
+
+fn poll_h3(
+    conn: &mut quiche::Connection,
+    h3_conn: &mut quiche::h3::Connection,
+    connect_stream_id: u64,
+) -> Result<()> {
     use quiche::h3::NameValue as _;
 
     let mut discard = [0u8; 4096];
@@ -955,11 +989,11 @@ fn poll_h3(conn: &mut quiche::Connection, h3_conn: &mut quiche::h3::Connection) 
                     tracing::debug!(
                         stream_id,
                         status = %String::from_utf8_lossy(status),
-                        "received H3 control response status"
+                        "received H3 response status"
                     );
                     if status != b"200" {
                         tracing::warn!(
-                            "H3 control request on stream {stream_id} returned status {}",
+                            "H3 request on stream {stream_id} returned status {}",
                             String::from_utf8_lossy(status)
                         );
                     }
@@ -972,7 +1006,7 @@ fn poll_h3(conn: &mut quiche::Connection, h3_conn: &mut quiche::h3::Connection) 
                         tracing::debug!(
                             stream_id,
                             response_bytes = read,
-                            "received H3 control response body"
+                            "received H3 response body"
                         );
                     }
                     Err(err) => {
@@ -981,17 +1015,37 @@ fn poll_h3(conn: &mut quiche::Connection, h3_conn: &mut quiche::h3::Connection) 
                     }
                 }
             },
+            Ok((stream_id, quiche::h3::Event::Finished)) => {
+                if let Some(reason) = connect_ip_termination_reason(
+                    connect_stream_id,
+                    stream_id,
+                    H3StreamTermination::Finished,
+                ) {
+                    bail!(reason);
+                }
+                tracing::debug!("auxiliary H3 request stream {stream_id} finished");
+            }
             Ok((stream_id, quiche::h3::Event::Reset(code))) => {
-                tracing::warn!("H3 control stream {stream_id} was reset with code {code}");
+                if let Some(reason) = connect_ip_termination_reason(
+                    connect_stream_id,
+                    stream_id,
+                    H3StreamTermination::Reset(code),
+                ) {
+                    bail!(reason);
+                }
+                tracing::warn!(
+                    "auxiliary H3 request stream {stream_id} was reset with code {code}"
+                );
             }
             Ok(_) => {}
             Err(quiche::h3::Error::Done) => break,
             Err(e) => {
-                tracing::warn!("h3 poll error: {e}");
-                break;
+                return Err(anyhow!("HTTP/3 poll failed: {e}"));
             }
         }
     }
+
+    Ok(())
 }
 
 async fn drain_incoming_datagrams(
@@ -1146,6 +1200,29 @@ mod tests {
         assert_eq!(duration_millis(Duration::ZERO), 0);
         assert_eq!(duration_millis(Duration::from_nanos(1)), 1);
         assert_eq!(duration_millis(Duration::from_secs(90)), 90_000);
+    }
+
+    #[test]
+    fn connect_ip_stream_termination_requires_session_reconnect() {
+        let reset = connect_ip_termination_reason(0, 0, H3StreamTermination::Reset(0x100))
+            .expect("CONNECT-IP reset must terminate the tunnel");
+        assert!(reset.contains("HTTP/3 error code 256 (0x100)"));
+        assert!(reset.contains("RFC 9484 tunnel is closed"));
+
+        let finished = connect_ip_termination_reason(0, 0, H3StreamTermination::Finished)
+            .expect("CONNECT-IP FIN must terminate the tunnel");
+        assert!(finished.contains("request stream 0 finished"));
+
+        assert_eq!(
+            connect_ip_termination_reason(0, 4, H3StreamTermination::Reset(0x100)),
+            None,
+            "an auxiliary H3 request reset must not close CONNECT-IP"
+        );
+        assert_eq!(
+            connect_ip_termination_reason(0, 8, H3StreamTermination::Finished),
+            None,
+            "an auxiliary H3 request FIN must not close CONNECT-IP"
+        );
     }
 
     #[test]
