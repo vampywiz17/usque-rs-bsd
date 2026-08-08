@@ -231,7 +231,7 @@ pub async fn run() -> Result<()> {
         Commands::NativeTun(args) => native_tun(&cli.config, args).await,
         Commands::MeshNode(args) => mesh_node(&cli.config, args).await,
         Commands::Version => {
-            println!("usque-nativetun version: {}", env!("CARGO_PKG_VERSION"));
+            println!("usque-nativetun version: {}", internal::CLIENT_VERSION);
             println!("Modes: native TUN client, optional route-neutral Mesh node");
             Ok(())
         }
@@ -493,7 +493,7 @@ async fn enroll(config_path: &str, args: EnrollArgs) -> Result<()> {
     if !args.name.trim().is_empty() {
         identity.name = args.name.trim().to_string();
     }
-    identity.client_version = env!("CARGO_PKG_VERSION").to_string();
+    identity.client_version = internal::CLIENT_VERSION.to_string();
 
     let (mut private_key_der, mut public_key_der): (Vec<u8>, Vec<u8>) = if args.regen_key {
         tracing::info!("Regenerating key pair...");
@@ -683,11 +683,7 @@ async fn run_tunnel(
         TunnelRole::Client => ("nativetun", "TunnelOnly"),
         TunnelRole::MeshNode => ("mesh-node", "MeshNode"),
     };
-    let client_version = if cfg.device_identity.client_version.is_empty() {
-        env!("CARGO_PKG_VERSION")
-    } else {
-        &cfg.device_identity.client_version
-    };
+    let client_version = internal::runtime_client_version(&cfg.device_identity);
     let user_agent =
         format!("usque-nativetun/{client_version} (FreeBSD; {user_agent_role}; MASQUE)");
 

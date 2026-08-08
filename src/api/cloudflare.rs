@@ -142,7 +142,7 @@ pub async fn get_registration(registration_id: &str, access_token: &str) -> Resu
 
 pub(crate) fn client_headers(req: RequestBuilder) -> RequestBuilder {
     req.header("User-Agent", internal::client_user_agent())
-        .header("CF-Client-Version", env!("CARGO_PKG_VERSION"))
+        .header("CF-Client-Version", internal::CLIENT_VERSION)
         .header("Content-Type", "application/json; charset=UTF-8")
 }
 

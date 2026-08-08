@@ -20,6 +20,10 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   non-interactive registration, P-256 enrollment, device-state authorization,
   CONNECT-IP/PMTUD establishment, dual-stack zero-loss ICMP, and HTTPS egress.
   A stale or mismatched Client ID/Secret pair fails closed before registration.
+- Runtime device-state, native-TUN user-agent, and Mesh CONNECT-IP version
+  reporting uses the current binary version. The version persisted in old
+  configs remains registration history and cannot pin live reporting after an
+  upgrade.
 - MASQUE key enrollment API ported to Rust.
 - `config.json` fields needed by native TUN preserved.
 - Native TUN mode implemented with `tun-rs`.

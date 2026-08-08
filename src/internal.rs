@@ -18,6 +18,15 @@ pub const DEFAULT_MODEL: &str = "FreeBSD";
 pub const KEY_TYPE_MASQUE: &str = "secp256r1";
 pub const TUN_TYPE_MASQUE: &str = "masque";
 pub const DEFAULT_LOCALE: &str = "en_US";
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Return the version of the currently running binary.
+///
+/// The identity version is registration-time metadata persisted for
+/// compatibility; it must not override live telemetry or tunnel headers.
+pub fn runtime_client_version(_registered_identity: &DeviceIdentity) -> &'static str {
+    CLIENT_VERSION
+}
 
 pub fn api_url() -> String {
     std::env::var("USQUE_API_URL").unwrap_or_else(|_| API_URL.to_string())
@@ -28,10 +37,7 @@ pub fn api_version() -> String {
 }
 
 pub fn client_user_agent() -> String {
-    format!(
-        "usque-nativetun/{} (FreeBSD; TunnelOnly; MASQUE)",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("usque-nativetun/{CLIENT_VERSION} (FreeBSD; TunnelOnly; MASQUE)")
 }
 
 pub fn detect_device_identity(
@@ -51,7 +57,7 @@ pub fn detect_device_identity(
         manufacturer: "FreeBSD Project".to_string(),
         model: non_empty(requested_model).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         os_version,
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        client_version: CLIENT_VERSION.to_string(),
         serial_number,
         locale: non_empty(locale).unwrap_or_else(|| DEFAULT_LOCALE.to_string()),
     }
@@ -130,4 +136,22 @@ pub fn check_ifname(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{runtime_client_version, CLIENT_VERSION};
+    use crate::models::DeviceIdentity;
+
+    #[test]
+    fn runtime_version_ignores_historical_registration_version() {
+        let identity = DeviceIdentity {
+            client_version: "0.7.0".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(runtime_client_version(&identity), CLIENT_VERSION);
+        assert_eq!(CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
+        assert_ne!(runtime_client_version(&identity), identity.client_version);
+    }
 }

@@ -9,6 +9,15 @@ available in the Git history.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-09
+
+### Fixed
+
+- Live device-state telemetry, the native-TUN user agent, and the Mesh
+  CONNECT-IP client-version header now report the running binary version
+  instead of the historical version persisted at registration. Existing
+  client and Mesh configurations update without re-registration or file edits.
+
 ### Added
 
 - Optional egress-client enrollment from Cloudflare's documented Linux

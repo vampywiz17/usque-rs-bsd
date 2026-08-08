@@ -217,11 +217,7 @@ impl DeviceStateReporter {
         } else {
             registration.policy.policy_id
         };
-        let client_version = if app_cfg.device_identity.client_version.trim().is_empty() {
-            env!("CARGO_PKG_VERSION").to_string()
-        } else {
-            app_cfg.device_identity.client_version.clone()
-        };
+        let client_version = internal::runtime_client_version(&app_cfg.device_identity).to_string();
         let cfg = ReporterConfig {
             doh_subdomain: format!("{account_id}.cloudflare-gateway.com"),
             account_id,

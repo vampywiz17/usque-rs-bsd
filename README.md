@@ -459,6 +459,11 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   service-token headers are origin-confined to the organization Access host;
   only the returned, origin-validated enrollment JWT reaches the inherited
   device-registration request. No service-token credential is persisted.
+- The client version stored in `config.json` records registration-time
+  identity metadata. Live device-state telemetry and tunnel protocol headers
+  always use the running binary version, so upgrades are reflected for existing
+  client and Mesh registrations without re-registration or configuration
+  rewrites.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.
