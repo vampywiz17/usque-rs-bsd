@@ -10,6 +10,16 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
 - Client registration accepts an owner-only, non-symlink JWT file through
   `--jwt-file`, allowing a privilege-separated OPNsense frontend to avoid
   exposing enrollment credentials in process arguments.
+- Egress-client registration optionally reads Cloudflare's documented Linux
+  `mdm.xml` service-token fields from an owner-only, non-symlink file. It sends
+  the standard Access headers only to the organization `/warp` endpoint,
+  validates the custom-scheme callback origin, and passes only the resulting
+  JWT to device registration. Credentials are not persisted and this path
+  remains separate from Mesh Connector enrollment.
+- Authorized 2026-08-08 end-to-end testing confirmed Access JWT issuance,
+  non-interactive registration, P-256 enrollment, device-state authorization,
+  CONNECT-IP/PMTUD establishment, dual-stack zero-loss ICMP, and HTTPS egress.
+  A stale or mismatched Client ID/Secret pair fails closed before registration.
 - MASQUE key enrollment API ported to Rust.
 - `config.json` fields needed by native TUN preserved.
 - Native TUN mode implemented with `tun-rs`.

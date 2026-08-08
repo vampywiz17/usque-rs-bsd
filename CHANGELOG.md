@@ -9,6 +9,25 @@ available in the Git history.
 
 ## [Unreleased]
 
+### Added
+
+- Optional egress-client enrollment from Cloudflare's documented Linux
+  `mdm.xml` keys (`organization`, `auth_client_id`, and
+  `auth_client_secret`) through `register --mdm-file`.
+- A dedicated Cloudflare Access enrollment exchange: service-token credentials
+  are sent only to `https://<organization>.cloudflareaccess.com/warp`, redirects
+  are not followed, and only an origin-bound `com.cloudflare.warp://.../auth`
+  callback JWT is accepted for the existing device-registration request.
+- Owner-only, non-symlink MDM file validation and tests proving service-token
+  headers cannot reach the device-registration origin.
+
+### Validated
+
+- Authorized end-to-end testing on 2026-08-08 confirmed Access JWT issuance,
+  non-interactive device registration, P-256 MASQUE key enrollment, CONNECT-IP
+  establishment, truthful device-state authorization, dual-stack addressing,
+  zero-loss IPv4/IPv6 ICMP, and HTTPS traffic through the egress tunnel.
+
 ## [0.8.1] - 2026-08-02
 
 ### Fixed

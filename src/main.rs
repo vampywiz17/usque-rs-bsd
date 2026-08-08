@@ -2,6 +2,7 @@ mod api;
 mod commands;
 mod config;
 mod internal;
+mod mdm;
 mod models;
 mod native_tun;
 

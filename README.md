@@ -18,7 +18,7 @@ read the [legal and interoperability notice](LEGAL.md), the maintained
 
 - Native TUN mode only
 - FreeBSD as the primary target
-- Cloudflare registration and MASQUE key enrollment
+- Cloudflare interactive, JWT or service-token registration and MASQUE key enrollment
 - Optional, experimental and unsupported FreeBSD Mesh node mode
 - Stable FreeBSD device identity and MASQUE-native registration metadata
 - Cloudflare device orchestration status for TunnelOnly/MASQUE sessions
@@ -42,7 +42,7 @@ bug fix that is not present upstream.
 | Platform and TUN backend | Linux-only `tun` plus `rtnetlink` | Native FreeBSD support through the public `tun-rs` API |
 | QUIC stack | `quiche` 0.22 with fixed 1350-byte UDP payloads | Pinned `quiche` 0.29.3 with RFC 8899 DPLPMTUD |
 | TUN MTU and IPv6 | Fixed at 1280 | Starts conservatively, follows quiche's writable DATAGRAM capacity up to the configured ceiling, and activates IPv6 only at the RFC 8200 minimum MTU |
-| Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment and truthful FreeBSD metadata |
+| Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment, truthful FreeBSD metadata, and optional documented Cloudflare Access service-token authentication |
 | Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
@@ -125,6 +125,68 @@ to a regular file, and deny all group/other access. The resulting
 credential-bearing configuration is also restricted to mode `0600`. The legacy
 `--jwt` option remains available for interactive compatibility, but automation
 should use `--jwt-file`.
+
+For non-interactive egress-client enrollment, Cloudflare documents a Linux
+`mdm.xml` containing `organization`, `auth_client_id`, and
+`auth_client_secret`. Create a Cloudflare Access service token, create a Device
+Enrollment policy with action **Service Auth** and an **Include -> Service
+Token** selector for that exact token, then attach the policy to Device
+Enrollment permissions.
+
+Create an owner-only MDM file in Cloudflare's documented flat dictionary form:
+
+```sh
+umask 077
+install -m 600 /dev/null /absolute/path/mdm.xml
+vi /absolute/path/mdm.xml
+chmod 600 /absolute/path/mdm.xml
+
+./target/release/usque-nativetun \
+  --config /absolute/path/client.json register \
+  --mdm-file /absolute/path/mdm.xml \
+  --accept-tos
+```
+
+```xml
+<dict>
+  <key>organization</key>
+  <string>REPLACE_WITH_ZERO_TRUST_TEAM_NAME</string>
+  <key>auth_client_id</key>
+  <string>REPLACE_WITH_CLIENT_ID.access</string>
+  <key>auth_client_secret</key>
+  <string>REPLACE_WITH_CLIENT_SECRET</string>
+</dict>
+```
+
+The MDM file cannot be combined with `--jwt` or `--jwt-file`. It must be an
+absolute-path, non-symlink regular file owned by the effective user with no
+group or other access (normally mode `0600`). The implementation parses only
+the required MDM strings and ignores supported optional deployment values.
+
+The service-token headers are sent only to Cloudflare Access at
+`https://<organization>.cloudflareaccess.com/warp`; automatic redirects are
+disabled. A successful response must be an origin-bound
+`com.cloudflare.warp://<organization>.cloudflareaccess.com/auth?token=...`
+callback containing one structurally valid JWT. Only that JWT is supplied to
+the existing device-registration request. The client ID, secret, and JWT are
+not logged or persisted in `config.json`.
+
+Cloudflare represents successful service-token enrollment as
+`non_identity@<team-name>.cloudflareaccess.com`, so identity-based policies do
+not apply. Service tokens expire and their secret is shown only once; lifecycle
+and rotation remain the administrator's responsibility.
+
+> [!NOTE]
+> Authorized end-to-end validation on 2026-08-08 confirmed the complete flow:
+> Access issued an enrollment JWT, Cloudflare created the non-interactive device
+> registration, P-256 MASQUE enrollment completed, CONNECT-IP established with
+> PMTUD, device-state authorization succeeded, and both assigned IPv4 and IPv6
+> addresses carried traffic. Five IPv4 and five IPv6 echo requests completed
+> with zero loss, and an HTTPS Cloudflare trace succeeded through the tunnel.
+>
+> A stale or mismatched Client ID/Secret pair is intentionally rejected before
+> device registration. When rotating a service token, update both MDM values;
+> Cloudflare displays the new secret only in the rotation response.
 
 The generated configuration contains credentials. Do not publish or commit it.
 
@@ -391,6 +453,12 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   Public Cloudflare documentation confirms the orchestration SNI and several
   registration models, but not the complete enrollment and device-state
   request contracts used by this project.
+- Optional egress-client service-token enrollment reads Cloudflare's documented
+  Linux MDM keys, uses the documented Access service-token headers at the
+  observed `/warp` enrollment endpoint, and validates its callback. The
+  service-token headers are origin-confined to the organization Access host;
+  only the returned, origin-validated enrollment JWT reaches the inherited
+  device-registration request. No service-token credential is persisted.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.

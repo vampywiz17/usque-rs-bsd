@@ -1,3 +1,4 @@
+pub mod access;
 pub mod cloudflare;
 pub mod device_state;
 mod freebsd_telemetry;

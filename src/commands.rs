@@ -1,3 +1,4 @@
+use crate::api::access;
 use crate::api::cloudflare::{self, EnrollFailure};
 use crate::api::device_state::DeviceStateReporter;
 use crate::api::icmp;
@@ -8,6 +9,7 @@ use crate::api::masque::{
 use crate::api::mesh::{self, MeshNodeToken, CONNECTOR_REGISTRATION_PLATFORM};
 use crate::config::{self, AppConfig, MeshNodeIdentity, TunnelRole};
 use crate::internal;
+use crate::mdm::ServiceTokenEnrollment;
 use crate::models::{AccountData, DeviceIdentity, INVALID_PUBLIC_KEY};
 use crate::native_tun::{TunOptions, TunRsDevice, IPV6_MIN_MTU};
 use anyhow::{anyhow, Context, Result};
@@ -61,11 +63,18 @@ pub struct RegisterArgs {
     #[arg(short, long, default_value = "")]
     pub name: String,
     /// Cloudflare Access enrollment JWT. Prefer --jwt-file for automation.
-    #[arg(long, default_value = "", conflicts_with = "jwt_file")]
+    #[arg(
+        long,
+        default_value = "",
+        conflicts_with_all = ["jwt_file", "mdm_file"]
+    )]
     pub jwt: String,
     /// Private enrollment JWT file. Unix permissions are validated before use.
-    #[arg(long, value_name = "PATH", conflicts_with = "jwt")]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["jwt", "mdm_file"])]
     pub jwt_file: Option<PathBuf>,
+    /// Owner-only Cloudflare MDM XML file containing organization and service-token settings.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["jwt", "jwt_file"])]
+    pub mdm_file: Option<PathBuf>,
     #[arg(short = 'a', long)]
     pub accept_tos: bool,
 }
@@ -230,7 +239,7 @@ pub async fn run() -> Result<()> {
 }
 
 async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
-    let jwt = load_registration_jwt(&args)?;
+    let credentials = load_registration_credentials(&args)?;
     if Path::new(config_path).exists() {
         println!("You already have a config. Do you want to overwrite it? (y/n) ");
         let mut response = String::new();
@@ -243,7 +252,7 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
     }
 
     let identity = internal::detect_device_identity(&args.name, &args.model, &args.locale);
-    if jwt.is_none() {
+    if credentials.is_none() {
         tracing::info!(
             "Registering MASQUE device '{}' ({} {}, client {})",
             identity.name,
@@ -251,16 +260,38 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
             identity.os_version,
             identity.client_version
         );
-    } else {
+    } else if matches!(credentials.as_ref(), Some(RegistrationCredentials::Jwt(_))) {
         tracing::info!(
             "Registering MASQUE device '{}' using JWT authentication",
             identity.name
         );
+    } else {
+        tracing::info!(
+            "Registering MASQUE device '{}' using Cloudflare Access service-token authentication",
+            identity.name
+        );
     }
 
+    let registration_jwt = match credentials {
+        Some(RegistrationCredentials::Jwt(jwt)) => Some(jwt),
+        Some(RegistrationCredentials::ServiceToken(config)) => {
+            tracing::info!(
+                "Requesting a device-enrollment JWT from Cloudflare Access organization '{}'",
+                config.organization()
+            );
+            Some(access::acquire_service_token_jwt(&config).await?)
+        }
+        None => None,
+    };
+
     let (private_key_der, public_key_der) = internal::generate_ec_key_pair()?;
-    let account =
-        cloudflare::register(&identity, &public_key_der, jwt.as_deref(), args.accept_tos).await?;
+    let account = cloudflare::register(
+        &identity,
+        &public_key_der,
+        registration_jwt.as_deref(),
+        args.accept_tos,
+    )
+    .await?;
 
     tracing::info!("Enrolling device key...");
     let updated = enroll_or_fail(&account, &public_key_der, &identity).await?;
@@ -271,27 +302,43 @@ async fn register(config_path: &str, args: RegisterArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_registration_jwt(args: &RegisterArgs) -> Result<Option<String>> {
-    if let Some(path) = &args.jwt_file {
-        return read_private_registration_token(path).map(Some);
-    }
-    let jwt = args.jwt.trim();
-    Ok((!jwt.is_empty()).then(|| jwt.to_string()))
+enum RegistrationCredentials {
+    Jwt(String),
+    ServiceToken(ServiceTokenEnrollment),
 }
 
-fn read_private_registration_token(path: &Path) -> Result<String> {
+fn load_registration_credentials(args: &RegisterArgs) -> Result<Option<RegistrationCredentials>> {
+    if let Some(path) = &args.jwt_file {
+        return read_private_registration_secret(path, "registration JWT")
+            .map(RegistrationCredentials::Jwt)
+            .map(Some);
+    }
+    let jwt = args.jwt.trim();
+    if !jwt.is_empty() {
+        return Ok(Some(RegistrationCredentials::Jwt(jwt.to_string())));
+    }
+
+    if let Some(path) = &args.mdm_file {
+        let xml = read_private_registration_text(path, "Cloudflare MDM")?;
+        let config = ServiceTokenEnrollment::from_mdm_xml(&xml)?;
+        return Ok(Some(RegistrationCredentials::ServiceToken(config)));
+    }
+    Ok(None)
+}
+
+fn read_private_registration_text(path: &Path, description: &str) -> Result<String> {
     if !path.is_absolute() {
         return Err(anyhow!(
-            "registration JWT file path must be absolute: {}",
+            "{description} file path must be absolute: {}",
             path.display()
         ));
     }
 
     let path_metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect registration JWT file {}", path.display()))?;
+        .with_context(|| format!("failed to inspect {description} file {}", path.display()))?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
         return Err(anyhow!(
-            "registration JWT path is not a non-symlink regular file: {}",
+            "{description} path is not a non-symlink regular file: {}",
             path.display()
         ));
     }
@@ -305,15 +352,18 @@ fn read_private_registration_token(path: &Path) -> Result<String> {
     }
     let file = options
         .open(path)
-        .with_context(|| format!("failed to open registration JWT file {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to inspect open JWT file {}", path.display()))?;
+        .with_context(|| format!("failed to open {description} file {}", path.display()))?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect open {description} file {}",
+            path.display()
+        )
+    })?;
     if !metadata.is_file() {
-        return Err(anyhow!("registration JWT path is not a regular file"));
+        return Err(anyhow!("{description} path is not a regular file"));
     }
     if metadata.len() > 64 * 1024 {
-        return Err(anyhow!("registration JWT file exceeds 64 KiB"));
+        return Err(anyhow!("{description} file exceeds 64 KiB"));
     }
 
     #[cfg(unix)]
@@ -323,32 +373,37 @@ fn read_private_registration_token(path: &Path) -> Result<String> {
         let effective_uid = unsafe { libc::geteuid() };
         if metadata.uid() != effective_uid {
             return Err(anyhow!(
-                "registration JWT file must be owned by the current effective user"
+                "{description} file must be owned by the current effective user"
             ));
         }
         if metadata.mode() & 0o077 != 0 {
             return Err(anyhow!(
-                "registration JWT file must not be accessible by group or others (use chmod 600 {})",
+                "{description} file must not be accessible by group or others (use chmod 600 {})",
                 path.display()
             ));
         }
     }
 
-    let mut jwt = String::new();
+    let mut value = String::new();
     file.take(64 * 1024 + 1)
-        .read_to_string(&mut jwt)
-        .with_context(|| format!("failed to read registration JWT file {}", path.display()))?;
-    if jwt.len() > 64 * 1024 {
-        return Err(anyhow!("registration JWT file exceeds 64 KiB"));
+        .read_to_string(&mut value)
+        .with_context(|| format!("failed to read {description} file {}", path.display()))?;
+    if value.len() > 64 * 1024 {
+        return Err(anyhow!("{description} file exceeds 64 KiB"));
     }
-    let jwt = jwt.trim();
-    if jwt.is_empty() {
-        return Err(anyhow!("registration JWT file is empty"));
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("{description} file is empty"));
     }
-    if jwt.contains(['\r', '\n']) {
-        return Err(anyhow!("registration JWT must contain exactly one line"));
+    Ok(value.to_string())
+}
+
+fn read_private_registration_secret(path: &Path, description: &str) -> Result<String> {
+    let value = read_private_registration_text(path, description)?;
+    if value.contains(['\r', '\n']) {
+        return Err(anyhow!("{description} must contain exactly one line"));
     }
-    Ok(jwt.to_string())
+    Ok(value)
 }
 
 async fn mesh_register(config_path: &str, args: MeshRegisterArgs) -> Result<()> {
@@ -992,6 +1047,106 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn mdm_registration_rejects_a_separate_jwt() {
+        use clap::Parser as _;
+
+        assert!(super::Cli::try_parse_from([
+            "usque-nativetun",
+            "register",
+            "--jwt",
+            "header.payload.signature",
+            "--mdm-file",
+            "/tmp/mdm.xml",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_registration_credentials_remain_unchanged() {
+        use clap::Parser as _;
+
+        let cli = super::Cli::try_parse_from(["usque-nativetun", "register"]).unwrap();
+        let super::Commands::Register(args) = cli.command else {
+            panic!("expected register command");
+        };
+        assert!(super::load_registration_credentials(&args)
+            .unwrap()
+            .is_none());
+
+        let cli = super::Cli::try_parse_from([
+            "usque-nativetun",
+            "register",
+            "--jwt",
+            "header.payload.signature",
+        ])
+        .unwrap();
+        let super::Commands::Register(args) = cli.command else {
+            panic!("expected register command");
+        };
+        let Some(super::RegistrationCredentials::Jwt(jwt)) =
+            super::load_registration_credentials(&args).unwrap()
+        else {
+            panic!("expected JWT credentials");
+        };
+        assert_eq!(jwt, "header.payload.signature");
+    }
+
+    #[test]
+    fn mdm_option_is_scoped_to_client_registration() {
+        use clap::Parser as _;
+
+        assert!(super::Cli::try_parse_from([
+            "usque-nativetun",
+            "mesh-register",
+            "--mdm-file",
+            "/tmp/mdm.xml",
+        ])
+        .is_err());
+        assert!(super::Cli::try_parse_from([
+            "usque-nativetun",
+            "mesh-node",
+            "--mdm-file",
+            "/tmp/mdm.xml",
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_mdm_file_loads_service_token_settings() {
+        use clap::Parser as _;
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "<dict><key>organization</key><string>example</string><key>auth_client_id</key><string>client.access</string><key>auth_client_secret</key><string>service-secret</string></dict>"
+        )
+        .unwrap();
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cli = super::Cli::try_parse_from([
+            "usque-nativetun",
+            "register",
+            "--mdm-file",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let super::Commands::Register(args) = cli.command else {
+            panic!("expected register command");
+        };
+        let credentials = super::load_registration_credentials(&args).unwrap();
+        let Some(super::RegistrationCredentials::ServiceToken(config)) = credentials else {
+            panic!("expected service-token credentials");
+        };
+        assert_eq!(config.organization(), "example");
+        assert_eq!(config.client_id(), "client.access");
+        assert_eq!(config.client_secret(), "service-secret");
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_jwt_file_requires_owner_only_permissions() {
@@ -1014,13 +1169,17 @@ mod tests {
         let super::Commands::Register(args) = cli.command else {
             panic!("expected register command");
         };
-        assert_eq!(
-            super::load_registration_jwt(&args).unwrap().as_deref(),
-            Some("header.payload.signature")
-        );
+        let credentials = super::load_registration_credentials(&args).unwrap();
+        let Some(super::RegistrationCredentials::Jwt(jwt)) = credentials else {
+            panic!("expected JWT credentials");
+        };
+        assert_eq!(jwt, "header.payload.signature");
 
         fs::set_permissions(file.path(), fs::Permissions::from_mode(0o640)).unwrap();
-        let error = super::load_registration_jwt(&args).unwrap_err().to_string();
+        let error = super::load_registration_credentials(&args)
+            .err()
+            .expect("group-readable secret must be rejected")
+            .to_string();
         assert!(error.contains("chmod 600"));
     }
 
@@ -1037,7 +1196,7 @@ mod tests {
         let link = directory.path().join("link.jwt");
         symlink(&target, &link).unwrap();
 
-        let error = super::read_private_registration_token(&link)
+        let error = super::read_private_registration_secret(&link, "registration JWT")
             .unwrap_err()
             .to_string();
         assert!(error.contains("non-symlink"));
