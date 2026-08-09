@@ -553,6 +553,84 @@ async fn mesh_node(config_path: &str, args: MeshNodeArgs) -> Result<()> {
     .await
 }
 
+fn release_version(value: &str) -> Option<[u64; 3]> {
+    let mut components = value.trim().split('.');
+    let version = [
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    ];
+    components.next().is_none().then_some(version)
+}
+
+fn registration_refresh_required(cfg: &AppConfig) -> bool {
+    matches!(
+        (
+            release_version(&cfg.device_identity.client_version),
+            release_version(internal::CLIENT_VERSION),
+        ),
+        (Some(registered), Some(running)) if running != registered
+    )
+}
+
+fn registration_refresh_identity(cfg: &AppConfig) -> Result<DeviceIdentity> {
+    let mut identity = cfg.device_identity.clone();
+    identity.client_version = internal::CLIENT_VERSION.to_string();
+
+    if cfg.role == TunnelRole::MeshNode {
+        let mesh_identity = cfg
+            .mesh_node
+            .as_ref()
+            .ok_or_else(|| anyhow!("Mesh node config is missing its node identity"))?;
+        let platform_claim = mesh_identity.registration_platform_claim.trim();
+        if platform_claim.is_empty() {
+            return Err(anyhow!(
+                "Mesh node config does not record its registration platform claim; refusing to guess registration metadata"
+            ));
+        }
+        identity.device_type = platform_claim.to_string();
+    }
+
+    Ok(identity)
+}
+
+async fn refresh_registration_after_version_change(config_path: &str, cfg: &mut AppConfig) {
+    if !registration_refresh_required(cfg) {
+        return;
+    }
+
+    let previous_version = cfg.device_identity.client_version.trim().to_string();
+    let result: Result<()> = async {
+        let secret = cfg.get_ec_private_key()?;
+        let public_key_der = secret.public_key().to_public_key_der()?.as_bytes().to_vec();
+        let account = AccountData {
+            id: cfg.id.clone(),
+            token: cfg.access_token.clone(),
+            ..Default::default()
+        };
+        let identity = registration_refresh_identity(cfg)?;
+
+        cloudflare::enroll_key(&account, &public_key_der, &identity)
+            .await
+            .map_err(|err| anyhow!(err))?;
+        cfg.device_identity.client_version = internal::CLIENT_VERSION.to_string();
+        cfg.save_sensitive(config_path)?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => tracing::info!(
+            "Cloudflare device registration refreshed after client version change from {} to {}",
+            previous_version,
+            internal::CLIENT_VERSION
+        ),
+        Err(err) => tracing::warn!(
+            "Cloudflare device registration refresh after client version change failed; tunnel startup will continue and the next process start will retry: {err:#}"
+        ),
+    }
+}
+
 async fn run_tunnel(
     config_path: &str,
     args: NativeTunArgs,
@@ -560,7 +638,7 @@ async fn run_tunnel(
     activation_probe_override: Option<IpAddr>,
     mesh_max_idle_timeout: Option<Duration>,
 ) -> Result<()> {
-    let cfg = AppConfig::load(config_path)?;
+    let mut cfg = AppConfig::load(config_path)?;
     if cfg.role != requested_role {
         return Err(anyhow!(
             "config role is '{}', but the selected command requires '{}'",
@@ -630,6 +708,8 @@ async fn run_tunnel(
             );
         }
     }
+
+    refresh_registration_after_version_change(config_path, &mut cfg).await;
 
     let activation_probe =
         build_mesh_activation_probe(&cfg, requested_role, activation_probe_override)?;
@@ -886,8 +966,11 @@ fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{maintain_edge_session, role_max_idle_timeout};
-    use crate::config::TunnelRole;
+    use super::{
+        maintain_edge_session, registration_refresh_identity, registration_refresh_required,
+        role_max_idle_timeout,
+    };
+    use crate::config::{AppConfig, MeshNodeIdentity, TunnelRole};
     use std::time::Duration;
 
     #[test]
@@ -920,6 +1003,83 @@ mod tests {
             role_max_idle_timeout(TunnelRole::Client, Some(Duration::from_secs(90))),
             Duration::ZERO
         );
+    }
+
+    fn registration_config(role: TunnelRole, version: &str) -> AppConfig {
+        AppConfig {
+            role,
+            device_identity: crate::models::DeviceIdentity {
+                name: "freebsd-test".to_string(),
+                device_type: "FreeBSD".to_string(),
+                client_version: version.to_string(),
+                serial_number: "stable-test-serial".to_string(),
+                ..Default::default()
+            },
+            mesh_node: (role == TunnelRole::MeshNode).then(|| MeshNodeIdentity {
+                account_tag: "a".repeat(32),
+                tunnel_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                activation_probe_target: None,
+                native_platform: "FreeBSD".to_string(),
+                registration_platform_claim: "linux".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn registration_refresh_runs_only_for_a_known_different_version() {
+        assert!(registration_refresh_required(&registration_config(
+            TunnelRole::Client,
+            "0.7.0"
+        )));
+        assert!(!registration_refresh_required(&registration_config(
+            TunnelRole::Client,
+            crate::internal::CLIENT_VERSION
+        )));
+        assert!(!registration_refresh_required(&registration_config(
+            TunnelRole::Client,
+            ""
+        )));
+        assert!(registration_refresh_required(&registration_config(
+            TunnelRole::Client,
+            "999.0.0"
+        )));
+        assert!(!registration_refresh_required(&registration_config(
+            TunnelRole::Client,
+            "not-a-version"
+        )));
+    }
+
+    #[test]
+    fn client_registration_refresh_preserves_the_truthful_platform() {
+        let cfg = registration_config(TunnelRole::Client, "0.7.0");
+        let identity = registration_refresh_identity(&cfg).unwrap();
+
+        assert_eq!(identity.device_type, "FreeBSD");
+        assert_eq!(identity.client_version, crate::internal::CLIENT_VERSION);
+        assert_eq!(identity.serial_number, "stable-test-serial");
+    }
+
+    #[test]
+    fn mesh_registration_refresh_preserves_its_recorded_platform_claim() {
+        let cfg = registration_config(TunnelRole::MeshNode, "0.7.0");
+        let identity = registration_refresh_identity(&cfg).unwrap();
+
+        assert_eq!(identity.device_type, "linux");
+        assert_eq!(identity.client_version, crate::internal::CLIENT_VERSION);
+        assert_eq!(identity.serial_number, "stable-test-serial");
+    }
+
+    #[test]
+    fn mesh_registration_refresh_refuses_to_guess_a_platform_claim() {
+        let mut cfg = registration_config(TunnelRole::MeshNode, "0.7.0");
+        cfg.mesh_node
+            .as_mut()
+            .unwrap()
+            .registration_platform_claim
+            .clear();
+
+        assert!(registration_refresh_identity(&cfg).is_err());
     }
 
     fn probe_config() -> crate::config::AppConfig {

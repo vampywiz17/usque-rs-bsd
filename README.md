@@ -44,7 +44,7 @@ bug fix that is not present upstream.
 | TUN MTU and IPv6 | Fixed at 1280 | Starts conservatively, follows quiche's writable DATAGRAM capacity up to the configured ceiling, and activates IPv6 only at the RFC 8200 minimum MTU |
 | Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment, truthful FreeBSD metadata, and optional documented Cloudflare Access service-token authentication |
 | Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
-| Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version |
+| Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version; an existing-key registration refresh runs once after a known binary-version change, including rollback |
 | Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
 | Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and one standards-compliant activation packet using Cloudflare's 1.1.1.1 service by default with Mesh-only overrides; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic, plus a finite Mesh-only QUIC idle timeout for dead-peer detection |
@@ -459,11 +459,16 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   service-token headers are origin-confined to the organization Access host;
   only the returned, origin-validated enrollment JWT reaches the inherited
   device-registration request. No service-token credential is persisted.
-- The client version stored in `config.json` records registration-time
-  identity metadata. Live device-state telemetry and tunnel protocol headers
-  always use the running binary version, so upgrades are reflected for existing
-  client and Mesh registrations without re-registration or configuration
-  rewrites.
+- Live device-state telemetry and tunnel protocol headers always use the
+  running binary version. When `config.json` contains a different known
+  registration-time version, the next process start makes exactly one
+  existing-device update with the same registration ID and P-256 public key.
+  The new version is saved only after Cloudflare accepts the update, preventing
+  normal restarts and internal QUIC reconnects from producing registration
+  traffic. Failure does not block the data plane and is retried on the next
+  process start. Unknown legacy versions are not guessed. Mesh updates preserve
+  their explicitly stored registration platform claim; runtime identity remains
+  truthful FreeBSD.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.
