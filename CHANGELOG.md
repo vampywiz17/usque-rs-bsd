@@ -9,6 +9,21 @@ available in the Git history.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-08-09
+
+### Fixed
+
+- On the first process start after a known client-version change, refresh the
+  existing Cloudflare device registration with the same device ID and P-256
+  key, then persist the new version only after the update succeeds. This lets
+  registration-backed device inventory catch up with the already-correct live
+  telemetry and Mesh CONNECT version.
+- The refresh is not sent on same-version starts, internal QUIC reconnects or
+  configs without known registration-version history. A failed refresh does not
+  block tunnel startup and is retried only on the next process start.
+- Mesh refreshes preserve the explicit platform claim stored at registration;
+  runtime user-agent and telemetry identity remain truthful FreeBSD data.
+
 ## [0.8.2] - 2026-08-09
 
 ### Fixed

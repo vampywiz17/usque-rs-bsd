@@ -21,9 +21,14 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   CONNECT-IP/PMTUD establishment, dual-stack zero-loss ICMP, and HTTPS egress.
   A stale or mismatched Client ID/Secret pair fails closed before registration.
 - Runtime device-state, native-TUN user-agent, and Mesh CONNECT-IP version
-  reporting uses the current binary version. The version persisted in old
-  configs remains registration history and cannot pin live reporting after an
-  upgrade.
+  reporting uses the current binary version.
+- A known persisted registration-version mismatch triggers one existing-device
+  update at process startup, reusing the same registration ID and P-256 key.
+  Success records the new version; failure leaves it unchanged for a later
+  process-start retry without blocking the tunnel. Same-version starts, internal
+  reconnects and configs without version history send no update. Mesh preserves
+  its stored registration platform claim while runtime reporting remains
+  truthful FreeBSD.
 - MASQUE key enrollment API ported to Rust.
 - `config.json` fields needed by native TUN preserved.
 - Native TUN mode implemented with `tun-rs`.
