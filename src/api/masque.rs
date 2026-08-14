@@ -32,6 +32,7 @@ const DGRAM_QUEUE_LEN: usize = 16_384;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
 const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
 const MESH_H3_STATS_INTERVAL: Duration = Duration::from_secs(15);
+const QUIC_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct QuicTransportConfig {
     pub keepalive_period: Duration,
@@ -625,6 +626,7 @@ async fn data_loop(
         let mut tx_queue: VecDeque<TxDatagram> = VecDeque::with_capacity(queue_size);
         let mut tun_reader_closed = false;
         let mut last_telemetry_sample = Instant::now() - Duration::from_secs(1);
+        let mut last_quic_diagnostics = Instant::now() - QUIC_DIAGNOSTICS_INTERVAL;
         // Publish the initial Mesh path state as soon as CONNECT succeeds.
         let mut last_h3_stats_report = Instant::now() - MESH_H3_STATS_INTERVAL;
         let mut pending_h3_stats_report: Option<PendingH3StatsReport> = None;
@@ -737,6 +739,11 @@ async fn data_loop(
             stats.quic_lost.store(qs.lost as u64, Ordering::Relaxed);
             stats.quic_retrans.store(qs.retrans as u64, Ordering::Relaxed);
 
+            if last_quic_diagnostics.elapsed() >= QUIC_DIAGNOSTICS_INTERVAL {
+                log_quic_path_diagnostics(conn, local_addr, endpoint, udp_batch);
+                last_quic_diagnostics = Instant::now();
+            }
+
             if conn.is_closed() {
                 bail!(
                     "QUIC connection closed (timed_out={}, local_error={:?}, peer_error={:?})",
@@ -842,6 +849,55 @@ async fn data_loop(
     result
 }
 
+fn log_quic_path_diagnostics(
+    conn: &quiche::Connection,
+    udp_local: SocketAddr,
+    udp_peer: SocketAddr,
+    udp_batch: &mut UdpBatchIo,
+) {
+    let Some(path) = conn.path_stats().find(|path| path.active) else {
+        tracing::debug!("QUIC path diagnostics skipped: no active path");
+        return;
+    };
+    let connection = conn.stats();
+    let micros = |duration: Duration| duration.as_micros().min(u128::from(u64::MAX)) as u64;
+    let millis = |duration: Duration| duration.as_millis().min(u128::from(u64::MAX)) as u64;
+    let (last_pacing_wait, max_pacing_wait, paced_sleeps) = udp_batch.take_pacing_diagnostics();
+
+    tracing::info!(
+        target: "usque::quic_diagnostics",
+        udp_local = %udp_local,
+        udp_peer = %udp_peer,
+        path_local = %path.local_addr,
+        path_peer = %path.peer_addr,
+        validation_state = ?path.validation_state,
+        rtt_us = micros(path.rtt),
+        min_rtt_us = ?path.min_rtt.map(micros),
+        max_rtt_us = ?path.max_rtt.map(micros),
+        rtt_var_us = micros(path.rttvar),
+        cwnd_bytes = path.cwnd,
+        delivery_rate_Bps = path.delivery_rate,
+        pmtu_bytes = path.pmtu,
+        pto_count = path.total_pto_count,
+        sent_packets = path.sent,
+        received_packets = path.recv,
+        lost_packets = path.lost,
+        dgram_sent = path.dgram_sent,
+        dgram_received = path.dgram_recv,
+        dgram_lost = path.dgram_lost,
+        retrans_packets = path.retrans,
+        sent_bytes = path.sent_bytes,
+        received_bytes = path.recv_bytes,
+        lost_bytes = path.lost_bytes,
+        acked_bytes = connection.acked_bytes,
+        spurious_lost_packets = connection.spurious_lost,
+        bytes_in_flight_duration_ms = millis(connection.bytes_in_flight_duration),
+        pacing_wait_last_us = micros(last_pacing_wait),
+        pacing_wait_max_us = micros(max_pacing_wait),
+        paced_sleeps,
+        "QUIC path diagnostics"
+    );
+}
 fn publish_tunnel_metrics(conn: &quiche::Connection, reporter: Option<&DeviceStateReporter>) {
     let Some(reporter) = reporter else {
         return;

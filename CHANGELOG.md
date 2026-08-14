@@ -9,6 +9,17 @@ available in the Git history.
 
 ## [Unreleased]
 
+### Added
+
+- Once-per-minute, read-only QUIC path diagnostics for long-running tunnel
+  analysis: the active UDP/path tuple, validation state, RTT, CWND, delivery
+  rate, PMTU, PTO, loss/retransmission, DATAGRAM and byte counters, cumulative
+  in-flight duration, and the pacing waits actually applied by the UDP batch
+  sender.
+- Diagnostics use only public quiche statistics and never invent unavailable
+  instantaneous bytes-in-flight or pacing-rate values. They do not change
+  client or Mesh transport behavior.
+
 ## [0.8.3] - 2026-08-09
 
 ### Fixed

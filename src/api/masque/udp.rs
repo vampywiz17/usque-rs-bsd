@@ -8,7 +8,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
 #[cfg(target_os = "freebsd")]
 use std::os::fd::AsRawFd;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(super) const MAX_DATAGRAM_SIZE: usize = 1500;
 pub(super) const MAX_UDP_BATCH_SIZE: usize = 64;
@@ -30,6 +30,9 @@ pub(super) struct UdpBatchIo {
     tx_at: Vec<Instant>,
     rx_buffers: Vec<Vec<u8>>,
     pub(super) batch_size: usize,
+    last_pacing_wait: Duration,
+    max_pacing_wait: Duration,
+    paced_sleeps: u64,
 }
 
 impl UdpBatchIo {
@@ -42,6 +45,9 @@ impl UdpBatchIo {
             tx_at: vec![Instant::now(); batch_size],
             rx_buffers: (0..batch_size).map(|_| vec![0u8; datagram_size]).collect(),
             batch_size,
+            last_pacing_wait: Duration::ZERO,
+            max_pacing_wait: Duration::ZERO,
+            paced_sleeps: 0,
         }
     }
 
@@ -90,6 +96,9 @@ impl UdpBatchIo {
         while start < count {
             let wait = self.tx_at[start].saturating_duration_since(Instant::now());
             if !wait.is_zero() {
+                self.last_pacing_wait = wait;
+                self.max_pacing_wait = self.max_pacing_wait.max(wait);
+                self.paced_sleeps = self.paced_sleeps.saturating_add(1);
                 tokio::time::sleep(wait).await;
             }
 
@@ -105,6 +114,18 @@ impl UdpBatchIo {
             start = end;
         }
         Ok(())
+    }
+
+    pub(super) fn take_pacing_diagnostics(&mut self) -> (Duration, Duration, u64) {
+        let sample = (
+            self.last_pacing_wait,
+            self.max_pacing_wait,
+            self.paced_sleeps,
+        );
+        self.last_pacing_wait = Duration::ZERO;
+        self.max_pacing_wait = Duration::ZERO;
+        self.paced_sleeps = 0;
+        sample
     }
 
     async fn send_batch(
@@ -547,5 +568,21 @@ mod tests {
         assert!(tuning.target_accepted);
         assert_eq!(tuning.effective, target);
         assert_eq!(state.requests.last(), Some(&target));
+    }
+    #[test]
+    fn pacing_diagnostics_are_interval_scoped() {
+        let mut io = UdpBatchIo::new(1500, 1);
+        io.last_pacing_wait = Duration::from_micros(120);
+        io.max_pacing_wait = Duration::from_micros(450);
+        io.paced_sleeps = 3;
+
+        assert_eq!(
+            io.take_pacing_diagnostics(),
+            (Duration::from_micros(120), Duration::from_micros(450), 3)
+        );
+        assert_eq!(
+            io.take_pacing_diagnostics(),
+            (Duration::ZERO, Duration::ZERO, 0)
+        );
     }
 }

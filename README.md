@@ -49,7 +49,7 @@ bug fix that is not present upstream.
 | Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and one standards-compliant activation packet using Cloudflare's 1.1.1.1 service by default with Mesh-only overrides; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic, plus a finite Mesh-only QUIC idle timeout for dead-peer detection |
 | Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; quiche `Finished`/`Reset` events on the RFC 9484 CONNECT-IP request stream terminate the session and invoke automatic endpoint rotation/reconnect |
-| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, and configurable congestion control/initial CWND |
+| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, configurable congestion control/initial CWND, and truthful periodic quiche path diagnostics |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 | Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
 | Verification | Build and unit tests | CI formatting and warnings-as-errors Clippy gates plus an operator-run FreeBSD QUIC/CONNECT-IP connection stress harness for client and Mesh roles |
@@ -384,6 +384,13 @@ other operating systems retain the wire contract but return an empty snapshot.
 | `--keepalive-period` | `25s` | Periodically schedules an RFC 9000 QUIC PING to preserve QUIC and outbound UDP/NAT state; use `0s` to disable |
 | `--max-idle-timeout` | `90s` | Mesh-only QUIC dead-peer timeout. Missing peer activity closes the stale session so the supervisor can reconnect; `0s` disables detection |
 
+Every established session emits a `QUIC path diagnostics` record once per
+minute. It reports the active UDP/path tuple, validation state, RTT range and
+variance, congestion window, delivery rate, PMTU, PTO/loss/retransmission
+counters, DATAGRAM counters, byte counters, and the actual userspace pacing
+waits requested by quiche. This is observational only and does not alter
+congestion control, pacing, PMTUD, routing, or reconnect behavior.
+
 Socket-buffer negotiation is local and per socket: it never changes
 `kern.ipc.maxsockbuf` or any other system-wide setting. If the kernel rejects
 the requested target, the log reports the original default, requested target
@@ -469,6 +476,13 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   process start. Unknown legacy versions are not guessed. Mesh updates preserve
   their explicitly stored registration platform claim; runtime identity remains
   truthful FreeBSD.
+- Periodic QUIC diagnostics use only quiche 0.29.3's public
+  `Connection::path_stats()` and `Connection::stats()` values plus the real
+  UDP socket tuple and pacing deadlines already consumed by the batch sender.
+  quiche does not expose instantaneous bytes-in-flight or its current pacing
+  rate through these public APIs, so the log deliberately does not estimate
+  them. It reports the available congestion window, delivery rate, cumulative
+  bytes-in-flight duration, and observed pacing waits instead.
 - Idle connections are kept alive with an RFC 9000 QUIC PING. This preserves
   the outer UDP/NAT mapping without injecting synthetic ICMP traffic into the
   native TUN interface.
