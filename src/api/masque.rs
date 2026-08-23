@@ -29,6 +29,7 @@ use timing::{discovered_tun_mtu, keepalive_remaining, pmtud_remaining};
 use udp::{create_connected_udp_socket, UdpBatchIo, MAX_DATAGRAM_SIZE, MAX_UDP_BATCH_SIZE};
 
 const DGRAM_QUEUE_LEN: usize = 16_384;
+const RX_DGRAM_DRAIN_BURST: usize = 32;
 const TX_CHANNEL_DRAIN_BURST: usize = 256;
 const MAX_PACKET_BUFFER_POOL_SIZE: usize = 16_384;
 const MESH_H3_STATS_INTERVAL: Duration = Duration::from_secs(15);
@@ -324,7 +325,7 @@ async fn run_tunnel_session(
         .clamp(1, MAX_PACKET_BUFFER_POOL_SIZE);
     let tx_queue_len = cfg.io.tx_queue_len.max(1).min(packet_buffer_pool_size);
     tracing::info!(
-        "QUIC tuning: quiche=0.29.3 cc={} initial_cwnd_packets={} max_udp_payload={} max_idle_timeout_ms={} pmtud={} pmtud_max_probes={} initial_tun_mtu={} max_tun_mtu={} dgram_queue_len={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
+        "QUIC tuning: quiche=0.29.3 cc={} initial_cwnd_packets={} max_udp_payload={} max_idle_timeout_ms={} pmtud={} pmtud_max_probes={} initial_tun_mtu={} max_tun_mtu={} dgram_queue_len={} rx_drain_burst={} tx_queue_len={} tx_burst_packets={} packet_buffer_pool_size={} udp_batch_size={} pacing={} relaxed_loss={} send_capacity_factor={} max_pacing_rate_bps={} udp_socket_buffer={}",
         cfg.quic.cc_algorithm.trim(),
         cfg.quic.initial_cwnd_packets,
         udp_payload,
@@ -334,6 +335,7 @@ async fn run_tunnel_session(
         cfg.path_mtu.initial_tun_mtu,
         cfg.path_mtu.max_tun_mtu,
         DGRAM_QUEUE_LEN,
+        RX_DGRAM_DRAIN_BURST,
         tx_queue_len,
         cfg.io.tx_burst_packets,
         packet_buffer_pool_size,
@@ -644,7 +646,8 @@ async fn data_loop(
             // quiche immediately so discovery progresses even on an idle TUN.
             udp_batch.flush_quic(socket, conn).await?;
             poll_h3(conn, h3_conn, connect_stream_id)?;
-            drain_incoming_datagrams(conn, flow_id, stats, dev).await;
+            let rx_drain_budget_exhausted =
+                drain_incoming_datagrams(conn, flow_id, stats, dev).await;
 
             let mut h3_output_queued = false;
             if report_h3_stats
@@ -764,7 +767,16 @@ async fn data_loop(
                 last_telemetry_sample = Instant::now();
             }
 
-            if !tx_queue.is_empty() && progress.queued >= tx_burst_packets && !progress.backpressure {
+            // A full receive burst means quiche may still hold downstream
+            // DATAGRAMs. Run every control and upstream stage above exactly
+            // once, then resume without sleeping. This prevents sustained
+            // downloads from monopolizing the single-connection packet pump
+            // while preserving quiche's ordering and congestion-control state.
+            if rx_drain_budget_exhausted
+                || (!tx_queue.is_empty()
+                    && progress.queued >= tx_burst_packets
+                    && !progress.backpressure)
+            {
                 continue;
             }
 
@@ -1109,10 +1121,12 @@ async fn drain_incoming_datagrams(
     flow_id: u64,
     stats: &Arc<Stats>,
     dev: &Arc<TunRsDevice>,
-) {
-    loop {
+) -> bool {
+    let mut drained = 0;
+    while drained < RX_DGRAM_DRAIN_BURST {
         match conn.dgram_recv_buf() {
             Ok(dgram) => {
+                drained += 1;
                 let dgram_ref = dgram.as_ref();
                 if let Some(ip_payload) = parse_datagram(dgram_ref, flow_id) {
                     if packet::validate_incoming(ip_payload).is_ok() {
@@ -1126,13 +1140,16 @@ async fn drain_incoming_datagrams(
                     }
                 }
             }
-            Err(quiche::Error::Done) => break,
+            Err(quiche::Error::Done) => return false,
             Err(e) => {
                 tracing::debug!("datagram recv error: {e}");
-                break;
+                return false;
             }
         }
     }
+
+    stats.rx_drain_budget_hits.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 // The one-packet/reconnect path deliberately shares the live protocol state

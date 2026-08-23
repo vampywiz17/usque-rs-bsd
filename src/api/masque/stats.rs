@@ -14,6 +14,7 @@ pub(super) struct Stats {
     pub(super) quic_retrans: AtomicU64,
     pub(super) tx_queue_len: AtomicU64,
     pub(super) tx_backpressure: AtomicU64,
+    pub(super) rx_drain_budget_hits: AtomicU64,
 }
 
 impl Stats {
@@ -28,6 +29,7 @@ impl Stats {
             quic_retrans: AtomicU64::new(0),
             tx_queue_len: AtomicU64::new(0),
             tx_backpressure: AtomicU64::new(0),
+            rx_drain_budget_hits: AtomicU64::new(0),
         })
     }
 }
@@ -38,7 +40,7 @@ pub(super) fn spawn_stats_task(stats: Arc<Stats>, start: Instant) -> tokio::task
         loop {
             interval.tick().await;
             tracing::info!(
-                "connected={} tx={} ({}) rx={} ({}) drop={} txq={} bp={} lost={} retrans={}",
+                "connected={} tx={} ({}) rx={} ({}) drop={} txq={} bp={} rxb={} lost={} retrans={}",
                 format_duration(start.elapsed()),
                 stats.tx_packets.load(Ordering::Relaxed),
                 format_bytes(stats.tx_bytes.load(Ordering::Relaxed)),
@@ -47,6 +49,7 @@ pub(super) fn spawn_stats_task(stats: Arc<Stats>, start: Instant) -> tokio::task
                 stats.dropped.load(Ordering::Relaxed),
                 stats.tx_queue_len.load(Ordering::Relaxed),
                 stats.tx_backpressure.load(Ordering::Relaxed),
+                stats.rx_drain_budget_hits.load(Ordering::Relaxed),
                 stats.quic_lost.load(Ordering::Relaxed),
                 stats.quic_retrans.load(Ordering::Relaxed),
             );

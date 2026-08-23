@@ -49,7 +49,7 @@ bug fix that is not present upstream.
 | Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and one standards-compliant activation packet using Cloudflare's 1.1.1.1 service by default with Mesh-only overrides; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic, plus a finite Mesh-only QUIC idle timeout for dead-peer detection |
 | Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; quiche `Finished`/`Reset` events on the RFC 9484 CONNECT-IP request stream terminate the session and invoke automatic endpoint rotation/reconnect |
-| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, configurable congestion control/initial CWND, and truthful periodic quiche path diagnostics |
+| FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, fair bounded QUIC-to-TUN receive draining, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, configurable congestion control/initial CWND, and truthful periodic quiche path diagnostics |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 | Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
 | Verification | Build and unit tests | CI formatting and warnings-as-errors Clippy gates plus an operator-run FreeBSD QUIC/CONNECT-IP connection stress harness for client and Mesh roles |
@@ -376,6 +376,7 @@ other operating systems retain the wire contract but return an empty snapshot.
 | `--pmtud-max-probes` | `3` | RFC 8899 probe failure threshold |
 | `--pmtud-revalidate-period` | `10m` | Rechecks a completed PMTU; `0s` disables periodic revalidation |
 | `--initial-cwnd-packets` | `32` | Faster startup without the latency penalty seen at larger packet sizes |
+| QUIC RX drain burst | `32` | Gives upstream TUN traffic and QUIC control work a scheduling opportunity during sustained downloads; fixed experimental value on this test branch |
 | `--tx-queue-len` | `8192` | Decouples the TUN reader from QUIC pacing |
 | `--tx-burst-packets` | `16` | Keeps upload latency low without reducing measured throughput |
 | `--packet-buffer-pool-size` | `1024` | Reusable upload buffers; clamped to `1..16384` and bounds the effective TX queue |
@@ -390,6 +391,11 @@ variance, congestion window, delivery rate, PMTU, PTO/loss/retransmission
 counters, DATAGRAM counters, byte counters, and the actual userspace pacing
 waits requested by quiche. This is observational only and does not alter
 congestion control, pacing, PMTUD, routing, or reconnect behavior.
+
+The ten-second operational record includes `rxb`, the cumulative number of
+times the 32-packet QUIC receive-drain budget was reached. A rising value under
+download load is expected and confirms that the main loop is interleaving
+upstream and control work instead of draining the entire receive queue at once.
 
 Socket-buffer negotiation is local and per socket: it never changes
 `kern.ipc.maxsockbuf` or any other system-wide setting. If the kernel rejects
@@ -503,6 +509,11 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   transitions without changing MASQUE framing. A packet is batched only after
   its quiche pacing deadline, so the syscall optimization does not bypass QUIC
   congestion-control timing.
+- QUIC DATAGRAM delivery to TUN is limited to 32 packets per packet-pump
+  iteration. The loop processes H3, PMTUD and TUN-to-QUIC work before immediately
+  resuming a non-empty receive queue. This is local scheduler fairness only: it
+  does not reorder packets, alter RFC 9484 framing or bypass quiche flow and
+  congestion control.
 - UDP receive and send buffers are negotiated independently through socket2's
   public `SO_RCVBUF`/`SO_SNDBUF` APIs before bind/connect. The implementation
   reads the kernel default, probes upward to the configured target, verifies
