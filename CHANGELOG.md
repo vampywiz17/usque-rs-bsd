@@ -9,6 +9,8 @@ available in the Git history.
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-08-24
+
 ### Added
 
 - Once-per-minute, read-only QUIC path diagnostics for long-running tunnel
@@ -19,6 +21,22 @@ available in the Git history.
 - Diagnostics use only public quiche statistics and never invent unavailable
   instantaneous bytes-in-flight or pacing-rate values. They do not change
   client or Mesh transport behavior.
+
+### Changed
+
+- Bound QUIC-to-TUN DATAGRAM draining to 32 packets per packet-pump iteration,
+  allowing upstream TUN, HTTP/3 and QUIC control work to run fairly during
+  sustained downloads. The scheduler-only change preserves packet ordering,
+  RFC 9484 framing, quiche flow control and congestion control.
+- Added the cumulative `rxb` operational counter for iterations that reach
+  the receive-drain budget, making the fairness behavior observable without
+  changing tunnel traffic.
+- Keep every API-advertised Cloudflare MASQUE endpoint while applying a stable
+  priority: advertised port 443 first, advertised port 1701 last, and all
+  other API ordering preserved.
+- Rotate through ordered fallbacks only before CONNECT-IP establishment. When
+  an established session ends, reconnect starts again from the preferred
+  endpoint.
 
 ## [0.8.3] - 2026-08-09
 
