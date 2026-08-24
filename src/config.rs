@@ -213,6 +213,16 @@ pub fn select_endpoints_from_config(
     if endpoints.is_empty() {
         anyhow::bail!("Cloudflare configuration did not contain a usable MASQUE endpoint");
     }
+
+    // Keep every API-advertised endpoint, but prefer the conventional QUIC
+    // port globally and leave UDP 1701 as the final fallback. The sort is
+    // stable, so Cloudflare's ordering is preserved among all other ports and
+    // within equal-priority address families and peers.
+    endpoints.sort_by_key(|endpoint| match endpoint.addr.0.port() {
+        443 => 0,
+        1701 => 2,
+        _ => 1,
+    });
     Ok(endpoints)
 }
 
@@ -272,9 +282,39 @@ mod tests {
             addresses,
             vec![
                 "[2001:db8::10]:443".parse().unwrap(),
-                "[2001:db8::10]:8443".parse().unwrap(),
                 "192.0.2.10:443".parse().unwrap(),
+                "[2001:db8::10]:8443".parse().unwrap(),
                 "192.0.2.10:8443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_selection_prioritizes_443_and_keeps_1701_last() {
+        let cfg = AppConfig {
+            masque_peers: vec![MasquePeerConfig {
+                endpoint_v4: "192.0.2.50".to_string(),
+                endpoint_v6: "2001:db8::50".to_string(),
+                endpoint_host: "masque.example".to_string(),
+                ports: vec![1701, 8443, 443, 500],
+                endpoint_pub_key: test_public_key_pem(5),
+            }],
+            ..Default::default()
+        };
+
+        let endpoints = select_endpoints_from_config(&cfg, false, 0).unwrap();
+        let addresses: Vec<SocketAddr> = endpoints.iter().map(|endpoint| endpoint.addr.0).collect();
+        assert_eq!(
+            addresses,
+            vec![
+                "192.0.2.50:443".parse().unwrap(),
+                "[2001:db8::50]:443".parse().unwrap(),
+                "192.0.2.50:8443".parse().unwrap(),
+                "192.0.2.50:500".parse().unwrap(),
+                "[2001:db8::50]:8443".parse().unwrap(),
+                "[2001:db8::50]:500".parse().unwrap(),
+                "192.0.2.50:1701".parse().unwrap(),
+                "[2001:db8::50]:1701".parse().unwrap(),
             ]
         );
     }

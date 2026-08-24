@@ -253,6 +253,7 @@ async fn run_tunnel_session(
     dev: &Arc<TunRsDevice>,
     mtu: usize,
     pending_pkt: &mut Option<Vec<u8>>,
+    session_established: &mut bool,
 ) -> Result<()> {
     let connection_started = Instant::now();
     let endpoint = selected_endpoint.addr.0;
@@ -427,6 +428,7 @@ async fn run_tunnel_session(
     .await?;
 
     tracing::info!("Connected to MASQUE server");
+    *session_established = true;
     if let Some(reporter) = &cfg.device_state {
         reporter.connected(connection_started.elapsed());
     }

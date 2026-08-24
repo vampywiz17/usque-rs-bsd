@@ -45,10 +45,10 @@ bug fix that is not present upstream.
 | Registration | Legacy API host, synthetic Android metadata and an initial WireGuard key | Current device orchestration host, direct P-256 MASQUE enrollment, truthful FreeBSD metadata, and optional documented Cloudflare Access service-token authentication |
 | Device monitoring | No Cloudflare device-state integration | Truthful device-state heartbeat with the real MASQUE lifecycle, quiche path statistics and target-gated native FreeBSD interface, CPU, memory and filesystem metrics |
 | Device identity | Random serial on each registration | Privacy-preserving stable serial and persisted name, OS, model, manufacturer and client version; an existing-key registration refresh runs once after a known binary-version change, including rollback |
-| Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins, with ordered fallback |
+| Endpoint handling | One selected address, fixed port 443 | Retains all API-provided peers, ports, IPv4/IPv6 endpoints and peer-specific pins; API-advertised port 443 is preferred globally, port 1701 is the final fallback, and all other API ordering is stable |
 | Mesh node | Not present | Explicitly optional route-neutral Mesh node mode using the Connector token flow, continuous Edge-session maintenance and one standards-compliant activation packet using Cloudflare's 1.1.1.1 service by default with Mesh-only overrides; FreeBSD enrollment requires a prominently disclosed `linux` platform compatibility claim because Cloudflare rejects `freebsd` |
 | Idle handling | Timeout processing only | Periodic RFC 9000 QUIC PING keepalive without synthetic inner-tunnel traffic, plus a finite Mesh-only QUIC idle timeout for dead-peer detection |
-| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; quiche `Finished`/`Reset` events on the RFC 9484 CONNECT-IP request stream terminate the session and invoke automatic endpoint rotation/reconnect |
+| Reconnection | Triggered primarily by outbound traffic | Optional continuous reconnect plus connect/disconnect hooks; quiche `Finished`/`Reset` events on the RFC 9484 CONNECT-IP request stream terminate the session, an established session returns to the preferred endpoint, and pre-establishment failures rotate through ordered fallbacks |
 | FreeBSD performance | Not applicable | Bounded reusable packet buffers, paced TX bursts, fair bounded QUIC-to-TUN receive draining, `sendmmsg`/`recvmmsg`, adaptive and verified per-socket buffer sizing, configurable congestion control/initial CWND, and truthful periodic quiche path diagnostics |
 | Certificate pinning | May continue when a peer certificate is unavailable | Fails closed unless insecure mode is explicitly requested |
 | Build profiles | Single development path | Maximum-runtime `release` profile with fat LTO and one codegen unit, plus a non-LTO `fast-release` profile with parallel code generation for faster iterative FreeBSD builds |
@@ -368,7 +368,7 @@ other operating systems retain the wire contract but return an empty snapshot.
 
 | Parameter | Default | Notes |
 | --- | ---: | --- |
-| `--connect-port` | `0` | Uses Cloudflare's API-provided endpoint ports; legacy configs fall back to `443`. A non-zero value overrides every endpoint port |
+| `--connect-port` | `0` | Uses Cloudflare's API-provided endpoint ports, preferring advertised port `443` and leaving advertised port `1701` as the final fallback; legacy configs fall back to `443`. A non-zero value overrides every endpoint port |
 | `--ipv6` | off | Prefers an IPv6 MASQUE endpoint while retaining IPv4 as fallback |
 | `--mtu` | `1200` | Safe initial TUN MTU used while PMTUD is running |
 | `--max-tun-mtu` | `1500` | Administrative inner-IP ceiling; the effective MTU remains bounded by quiche's discovered DATAGRAM capacity |
@@ -528,9 +528,12 @@ If `bbr2_gcongestion` is rejected, use `cubic` or `reno`.
   `recv_multiple`/`send_multiple`, GRO and offload APIs are Linux-only and are
   intentionally not emulated here.
 - New registrations retain every Cloudflare MASQUE peer, IPv4/IPv6 address,
-  endpoint hostname, port and peer-specific pin. Reconnects rotate through the
-  ordered endpoint list. Existing configurations remain valid and use port 443
-  when they do not contain an API port list.
+  endpoint hostname, port and peer-specific pin. The stable priority order puts
+  API-advertised port 443 first and port 1701 last without inventing or removing
+  a Cloudflare port. A failed connection attempt rotates through the remaining
+  fallbacks; once any endpoint establishes CONNECT-IP, its later termination
+  returns selection to the preferred endpoint. Existing configurations remain
+  valid and use port 443 when they do not contain an API port list.
 - Endpoint fallback is transport-only. DNS policy, routing and firewall state
   remain owned by the host FreeBSD system.
 - The FreeBSD raw TUN direction is documented but is not enabled by default; `tun-rs` remains the production backend.

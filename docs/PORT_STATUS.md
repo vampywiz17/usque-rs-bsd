@@ -51,8 +51,11 @@ This artifact is native-TUN-only. Everything unrelated to the `nativetun` path w
   toward the configured target through verified `SO_RCVBUF`/`SO_SNDBUF`
   operations; OS limits are retained without changing global sysctls.
 - Full Cloudflare MASQUE peer/address/port list is retained at enrollment.
-  Reconnects rotate across API-provided ports and IPv4/IPv6 endpoints while
-  preserving peer-specific certificate pins.
+  API-advertised port 443 is preferred globally, API-advertised port 1701 is
+  retained as the final fallback, and all other relative ordering remains
+  stable. Pre-establishment failures rotate across these IPv4/IPv6 fallbacks;
+  termination of an established session returns to the preferred endpoint.
+  Peer-specific certificate pins remain attached to every endpoint.
 - Legacy configurations remain supported; their endpoint port defaults to 443.
 - The MASQUE wire format remains unchanged; batching is below QUIC at the UDP
   socket boundary.
