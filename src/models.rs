@@ -145,3 +145,34 @@ pub struct Policy {
     #[serde(default)]
     pub switch_locked: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_errors_preserve_order_and_exact_matching() {
+        let errors: ApiError = serde_json::from_value(serde_json::json!({
+            "errors": [
+                {"message": "first"},
+                {"message": "second"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(errors.errors_as_string("; "), "first; second");
+        assert!(errors.has_error_message("second"));
+        assert!(!errors.has_error_message("Second"));
+    }
+
+    #[test]
+    fn missing_cloudflare_response_fields_keep_safe_defaults() {
+        let account: AccountData = serde_json::from_str("{}").unwrap();
+        assert!(account.id.is_empty());
+        assert!(account.token.is_empty());
+        assert!(account.config.peers.is_empty());
+        assert!(account.config.interface.addresses.v4.is_empty());
+        assert!(account.config.interface.addresses.v6.is_empty());
+        assert!(!account.policy.switch_locked);
+    }
+}

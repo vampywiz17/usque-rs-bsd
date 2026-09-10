@@ -87,3 +87,42 @@ fn format_duration(d: Duration) -> String {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initializes_all_transport_counters_to_zero() {
+        let stats = Stats::new();
+        assert_eq!(stats.tx_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.rx_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.tx_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.rx_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.quic_lost.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.quic_retrans.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.tx_queue_len.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.tx_backpressure.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.rx_drain_budget_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn formats_counter_units_at_binary_boundaries() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1536 * 1024), "1.5 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn formats_session_duration_without_losing_components() {
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m 00s");
+        assert_eq!(format_duration(Duration::from_secs(7384)), "2h 03m 04s");
+    }
+}

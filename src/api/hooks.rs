@@ -13,3 +13,13 @@ pub fn run_hook(path: &str, extra_env: &HashMap<String, String>) {
         Err(err) => tracing::warn!("failed to start hook {path}: {err}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_hook_is_an_explicit_no_op() {
+        run_hook("", &HashMap::new());
+    }
+}

@@ -540,4 +540,110 @@ mod tests {
         assert!(value["tunnelStatsDownstream"].get("packets_lost").is_none());
         assert!(value["tunnelStatsDownstream"].get("bytes_lost").is_none());
     }
+
+    #[test]
+    fn disconnected_payload_omits_stale_tunnel_metrics_but_keeps_host_observations() {
+        let cfg = test_config();
+        let metrics = TunnelMetrics {
+            local_ip: "2001:db8::10".parse().unwrap(),
+            rtt_us: 20_000,
+            min_rtt_us: Some(18_000),
+            rtt_var_us: 500,
+            packets_sent_upstream: 10,
+            packets_received_downstream: 12,
+            packets_lost_upstream: 1,
+            packets_retransmitted_upstream: 1,
+            bytes_sent_upstream: 1_000,
+            bytes_received_downstream: 2_000,
+            bytes_lost_upstream: 100,
+            bytes_retransmitted_upstream: 100,
+        };
+        let host = HostSnapshot {
+            interface: Some(InterfaceSnapshot {
+                name: "vtnet0".into(),
+                connection_type: "ethernet".into(),
+                network_sent_bps: Some(12_345),
+                network_rcvd_bps: Some(54_321),
+                device_ipv4: Some(IpSnapshot {
+                    address: "192.0.2.10".into(),
+                    netmask: "255.255.255.0".into(),
+                }),
+                device_ipv6: Some(IpSnapshot {
+                    address: "2001:db8::10".into(),
+                    netmask: "ffff:ffff:ffff:ffff::".into(),
+                }),
+            }),
+            cpu_pct: Some(0.25),
+            ram_used_pct: Some(0.5),
+            ram_available_kb: Some(1_048_576),
+            disk_usage_pct: Some(0.75),
+        };
+
+        let value = serde_json::to_value(build_payload(
+            &cfg,
+            ConnectionState::Disconnected,
+            Some(metrics),
+            host,
+        ))
+        .unwrap();
+
+        assert_eq!(value["status"], "Disconnected");
+        assert!(value["handshake_latency_ms"].is_null());
+        assert!(value["estimated_loss"].is_null());
+        assert!(value.get("tunnelStatsUpstream").is_none());
+        assert!(value.get("tunnelStatsDownstream").is_none());
+        assert_eq!(value["interfaces"][0]["name"], "vtnet0");
+        assert_eq!(value["interfaces"][0]["network_sent_bps"], 12_345);
+        assert_eq!(
+            value["interfaces"][0]["device_ipv4"]["address"],
+            "192.0.2.10"
+        );
+        assert_eq!(
+            value["interfaces"][0]["device_ipv6"]["address"],
+            "2001:db8::10"
+        );
+        assert_eq!(value["cpu_pct"], 0.25);
+        assert_eq!(value["ram_used_pct"], 0.5);
+        assert_eq!(value["ram_available_kb"], 1_048_576);
+        assert_eq!(value["disk_usage_pct"], 0.75);
+    }
+
+    #[test]
+    fn reporter_handle_tracks_connection_lifecycle_and_clears_stale_metrics() {
+        let (state_tx, state_rx) = watch::channel(None);
+        let tunnel_metrics = Arc::new(RwLock::new(None));
+        let reporter = DeviceStateReporter {
+            state_tx,
+            tunnel_metrics: tunnel_metrics.clone(),
+        };
+        let metrics = TunnelMetrics {
+            local_ip: "192.0.2.10".parse().unwrap(),
+            rtt_us: 16_000,
+            min_rtt_us: Some(12_000),
+            rtt_var_us: 1_500,
+            packets_sent_upstream: 100,
+            packets_received_downstream: 200,
+            packets_lost_upstream: 2,
+            packets_retransmitted_upstream: 1,
+            bytes_sent_upstream: 10_000,
+            bytes_received_downstream: 20_000,
+            bytes_lost_upstream: 240,
+            bytes_retransmitted_upstream: 120,
+        };
+
+        reporter.update_tunnel_metrics(metrics);
+        assert_eq!(*tunnel_metrics.read().unwrap(), Some(metrics));
+
+        reporter.connected(Duration::from_millis(42));
+        assert_eq!(
+            *state_rx.borrow(),
+            Some(ConnectionState::Connected {
+                handshake_latency_ms: 42
+            })
+        );
+
+        reporter.disconnected();
+        assert_eq!(*state_rx.borrow(), Some(ConnectionState::Disconnected));
+        assert_eq!(*tunnel_metrics.read().unwrap(), None);
+    }
 }

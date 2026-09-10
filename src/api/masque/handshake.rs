@@ -153,7 +153,63 @@ fn validate_connect_status(status: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_connect_status;
+    use super::*;
+    use crate::api::masque::{
+        CloudflareConnectProfile, DatagramIoConfig, LifecycleHooks, PathMtuConfig,
+        QuicTransportConfig, ReconnectPolicy,
+    };
+    use crate::config::EndpointAddr;
+    use p256::SecretKey;
+    use rand_core::OsRng;
+    use std::collections::HashMap;
+
+    fn test_config(private_key: SecretKey) -> MasqueConfig {
+        MasqueConfig {
+            private_key,
+            sni: "example.invalid".into(),
+            insecure: false,
+            endpoints: Vec::new(),
+            user_agent: "usque-test".into(),
+            connect_profile: CloudflareConnectProfile::Client,
+            quic: QuicTransportConfig {
+                keepalive_period: Duration::from_secs(25),
+                max_idle_timeout: Duration::from_secs(60),
+                initial_packet_size: 1200,
+                cc_algorithm: "cubic".into(),
+                initial_cwnd_packets: 32,
+                disable_pacing: false,
+                relaxed_loss: false,
+                send_capacity_factor: 1.0,
+                max_pacing_rate_bps: 0,
+            },
+            path_mtu: PathMtuConfig {
+                enabled: true,
+                max_probes: 3,
+                revalidate_period: Duration::from_secs(600),
+                initial_tun_mtu: 1200,
+                max_tun_mtu: 1500,
+                tunnel_ipv6: true,
+            },
+            io: DatagramIoConfig {
+                udp_socket_buffer: 262_144,
+                tx_queue_len: 1024,
+                tx_burst_packets: 16,
+                packet_buffer_pool_size: 1024,
+                udp_batch_size: 32,
+            },
+            reconnect: ReconnectPolicy {
+                delay: Duration::from_secs(1),
+                always: false,
+            },
+            hooks: LifecycleHooks {
+                on_connect: None,
+                on_disconnect: None,
+                env: HashMap::new(),
+            },
+            activation_probe: None,
+            device_state: None,
+        }
+    }
 
     #[test]
     fn accepts_successful_connect_status() {
@@ -169,5 +225,29 @@ mod tests {
             validate_connect_status("500").unwrap_err().to_string(),
             "CONNECT rejected with status 500"
         );
+    }
+
+    #[test]
+    fn generated_tls_material_uses_the_configured_identity_and_preserves_pin() {
+        let endpoint_pin = vec![1, 2, 3, 4];
+        let endpoint = MasqueEndpoint {
+            addr: EndpointAddr("192.0.2.1:443".parse().unwrap()),
+            host: "example.invalid".into(),
+            endpoint_pub_key_spki_der: endpoint_pin.clone(),
+        };
+        let material =
+            prepare_tls_material(&test_config(SecretKey::random(&mut OsRng)), &endpoint).unwrap();
+
+        assert_eq!(material.endpoint_pub_key_spki_der, endpoint_pin);
+        let cert_pem = std::fs::read(material.cert_pem_file.path()).unwrap();
+        let cert_der = pem::parse(cert_pem).unwrap().into_contents();
+        let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+        let actual_spki = cert.tbs_certificate.subject_pki.raw.to_vec();
+        assert!(verify_endpoint_key(&cert_der, &actual_spki));
+        assert!(!verify_endpoint_key(&cert_der, b"different-spki"));
+        assert!(!verify_endpoint_key(b"not-a-certificate", &actual_spki));
+
+        let key_pem = std::fs::read_to_string(material.key_pem_file.path()).unwrap();
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
     }
 }
