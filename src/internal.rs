@@ -140,8 +140,9 @@ pub fn check_ifname(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_client_version, CLIENT_VERSION};
+    use super::*;
     use crate::models::DeviceIdentity;
+    use p256::pkcs8::DecodePublicKey;
 
     #[test]
     fn runtime_version_ignores_historical_registration_version() {
@@ -153,5 +154,31 @@ mod tests {
         assert_eq!(runtime_client_version(&identity), CLIENT_VERSION);
         assert_eq!(CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
         assert_ne!(runtime_client_version(&identity), identity.client_version);
+    }
+
+    #[test]
+    fn generated_key_pair_contains_the_matching_p256_public_key() {
+        let (private_der, public_der) = generate_ec_key_pair().unwrap();
+        let private_key = SecretKey::from_sec1_der(&private_der).unwrap();
+        let public_key = p256::PublicKey::from_public_key_der(&public_der).unwrap();
+        assert_eq!(private_key.public_key(), public_key);
+    }
+
+    #[test]
+    fn validates_interface_names_without_changing_platform_policy() {
+        assert!(check_ifname("tun0").is_ok());
+        assert!(check_ifname("").is_err());
+        assert!(check_ifname("tun name").is_err());
+        assert!(check_ifname("tun/name").is_err());
+    }
+
+    #[test]
+    fn client_identity_headers_remain_truthful_and_project_owned() {
+        let user_agent = client_user_agent();
+        assert!(user_agent.starts_with("usque-nativetun/"));
+        assert!(user_agent.contains("FreeBSD"));
+        assert!(user_agent.contains("TunnelOnly"));
+        assert!(user_agent.contains("MASQUE"));
+        assert!(!user_agent.to_ascii_lowercase().contains("official"));
     }
 }

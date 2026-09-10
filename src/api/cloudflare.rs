@@ -169,3 +169,193 @@ impl std::fmt::Display for EnrollFailure {
 }
 
 impl std::error::Error for EnrollFailure {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::DeviceIdentity;
+    use serde_json::Value;
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+
+    static API_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct ApiUrlGuard(Option<OsString>);
+
+    impl ApiUrlGuard {
+        fn set(url: &str) -> Self {
+            let previous = std::env::var_os("USQUE_API_URL");
+            std::env::set_var("USQUE_API_URL", url);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ApiUrlGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("USQUE_API_URL", previous);
+            } else {
+                std::env::remove_var("USQUE_API_URL");
+            }
+        }
+    }
+
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            return false;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + content_length
+    }
+
+    fn serve_once(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, mpsc::Receiver<Vec<u8>>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !request_is_complete(&request) {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            request_tx.send(request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), request_rx, handle)
+    }
+
+    fn request_parts(request: &[u8]) -> (String, Value) {
+        let request = String::from_utf8(request.to_vec()).unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(body).unwrap()
+        };
+        (headers.to_ascii_lowercase(), body)
+    }
+
+    fn identity() -> DeviceIdentity {
+        DeviceIdentity {
+            name: "freebsd-test".into(),
+            device_type: "FreeBSD".into(),
+            manufacturer: "FreeBSD Project".into(),
+            model: "FreeBSD".into(),
+            os_version: "15.0".into(),
+            client_version: internal::CLIENT_VERSION.into(),
+            serial_number: "stable-serial".into(),
+            locale: "en_US".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registration_requests_preserve_the_cloudflare_wire_contract() {
+        let _lock = API_ENV_LOCK.lock().await;
+        let public_key = [7_u8; 65];
+
+        let (url, requests, server) =
+            serve_once("200 OK", r#"{"id":"t.registration","token":"access"}"#);
+        let _url = ApiUrlGuard::set(&url);
+        let registered = register(&identity(), &public_key, Some("jwt-value"), true)
+            .await
+            .unwrap();
+        assert_eq!(registered.id, "t.registration");
+        let (headers, body) = request_parts(&requests.recv().unwrap());
+        server.join().unwrap();
+        assert!(headers.starts_with("post /v0a4471/reg http/1.1"));
+        assert!(headers.contains("cf-access-jwt-assertion: jwt-value"));
+        assert!(headers.contains("content-type: application/json; charset=utf-8"));
+        assert_eq!(body["type"], "FreeBSD");
+        assert_eq!(body["key_type"], internal::KEY_TYPE_MASQUE);
+        assert_eq!(body["tunnel_type"], internal::TUN_TYPE_MASQUE);
+        assert_eq!(body["key"], general_purpose::STANDARD.encode(public_key));
+
+        let account = AccountData {
+            id: "t.registration".into(),
+            token: "access".into(),
+            ..Default::default()
+        };
+        let (url, requests, server) =
+            serve_once("200 OK", r#"{"id":"t.registration","token":"renewed"}"#);
+        let _url = ApiUrlGuard::set(&url);
+        let enrolled = enroll_key(&account, &public_key, &identity())
+            .await
+            .unwrap();
+        assert_eq!(enrolled.token, "renewed");
+        let (headers, body) = request_parts(&requests.recv().unwrap());
+        server.join().unwrap();
+        assert!(headers.starts_with("patch /v0a4471/reg/t.registration http/1.1"));
+        assert!(headers.contains("authorization: bearer access"));
+        assert_eq!(body["name"], "freebsd-test");
+        assert_eq!(body["manufacturer"], "FreeBSD Project");
+
+        let (url, requests, server) = serve_once(
+            "403 Forbidden",
+            r#"{"errors":[{"message":"enrollment denied"}]}"#,
+        );
+        let _url = ApiUrlGuard::set(&url);
+        let error = enroll_key(&account, &public_key, &identity())
+            .await
+            .unwrap_err();
+        requests.recv().unwrap();
+        server.join().unwrap();
+        match error {
+            EnrollFailure::Api { status, api_error } => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(api_error.has_error_message("enrollment denied"));
+            }
+            EnrollFailure::Transport(error) => panic!("unexpected transport error: {error:#}"),
+        }
+
+        let (url, requests, server) =
+            serve_once("200 OK", r#"{"id":"t.registration","token":"current"}"#);
+        let _url = ApiUrlGuard::set(&url);
+        let fetched = get_registration("t.registration", "access").await.unwrap();
+        assert_eq!(fetched.token, "current");
+        let (headers, _) = request_parts(&requests.recv().unwrap());
+        server.join().unwrap();
+        assert!(headers.starts_with("get /v0a4471/reg/t.registration http/1.1"));
+        assert!(headers.contains("authorization: bearer access"));
+
+        let (url, requests, server) = serve_once(
+            "401 Unauthorized",
+            r#"{"errors":[{"message":"expired token"}]}"#,
+        );
+        let _url = ApiUrlGuard::set(&url);
+        let error = get_registration("t.registration", "expired")
+            .await
+            .unwrap_err()
+            .to_string();
+        requests.recv().unwrap();
+        server.join().unwrap();
+        assert!(error.contains("401 Unauthorized"));
+        assert!(error.contains("expired token"));
+    }
+}
