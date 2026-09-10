@@ -574,6 +574,11 @@ cargo build --release
 
 GitHub Actions runs formatting, Clippy with warnings denied, a debug build and
 the complete test suite for every push and pull request targeting `main`.
+Changes to `Cargo.toml` or `Cargo.lock` also run a pinned `cargo-audit` scan,
+and an independent scheduled scan checks the committed lockfile weekly against
+the current RustSec advisory database. Dependabot checks Cargo dependencies and
+GitHub Actions weekly and proposes updates as reviewable pull requests; it does
+not change dependency versions directly on `main`.
 
 Repeated live QUIC/HTTP/3 CONNECT-IP establishment can be verified on FreeBSD
 without changing routes or firewall policy:
