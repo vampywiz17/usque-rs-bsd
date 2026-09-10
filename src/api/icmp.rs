@@ -127,11 +127,11 @@ fn compose_ipv6_packet_too_big(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
 
 fn checksum(buf: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = buf.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (chunks, remainder) = buf.as_chunks::<2>();
+    for &chunk in chunks {
+        sum += u32::from(u16::from_be_bytes(chunk));
     }
-    if let Some(&last) = chunks.remainder().first() {
+    if let Some(&last) = remainder.first() {
         sum += u32::from(u16::from_be_bytes([last, 0]));
     }
     while sum >> 16 != 0 {
