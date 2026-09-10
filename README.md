@@ -574,6 +574,12 @@ cargo build --release
 
 GitHub Actions runs formatting, Clippy with warnings denied, a debug build and
 the complete test suite for every push and pull request targeting `main`.
+Rust documentation is also built with warnings denied. A separate coverage job
+runs the Linux-compatible unit tests under LLVM instrumentation and uploads the
+result to Codecov using GitHub OIDC, so no long-lived Codecov token is stored in
+the repository. Platform-specific FreeBSD behavior remains covered by the
+FreeBSD build and operator-run integration tests rather than the Linux coverage
+percentage.
 Changes to `Cargo.toml` or `Cargo.lock` also run a pinned `cargo-audit` scan,
 and an independent scheduled scan checks the committed lockfile weekly against
 the current RustSec advisory database. Dependabot checks Cargo dependencies and

@@ -19,6 +19,10 @@ jobs:
       run: cargo fmt --all -- --check
     - name: Run Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
+    - name: Check documentation
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: cargo doc --no-deps --all-features
     - name: Build
       run: cargo build --verbose
     - name: Run tests
