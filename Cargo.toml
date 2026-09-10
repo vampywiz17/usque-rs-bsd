@@ -14,7 +14,7 @@ der = { version = "0.7", features = ["pem", "std"] }
 hex = "0.4"
 libc = "0.2"
 octets = "0.3"
-p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }
 pem = "3"
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 portable-atomic = { version = "1", features = ["fallback"] }
