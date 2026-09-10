@@ -15,7 +15,7 @@ hex = "0.4"
 libc = "0.2"
 octets = "0.3"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
-pem = "3"
+pem = "4"
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 portable-atomic = { version = "1", features = ["fallback"] }
 quiche = { version = "=0.29.3", features = ["gcongestion"] }
