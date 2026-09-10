@@ -25,10 +25,17 @@ jobs:
         run: cargo install cargo-llvm-cov --version 0.9.1 --locked
       - name: Generate coverage report
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Store coverage report
+        uses: actions/upload-artifact@v6
+        with:
+          name: lcov-report
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
           use_oidc: true
           files: lcov.info
           disable_search: true
-          fail_ci_if_error: true
+          fail_ci_if_error: false
